@@ -5,13 +5,23 @@ general:
 
 whitelist:
   sources:
+    # Основной источник: openlibrecommunity/twl — проверенные IP, обновляется ~ежедневно.
+    - type: github
+      name: twl-verified
+      url: https://raw.githubusercontent.com/openlibrecommunity/twl/main/code/scan/out/verify/verified.txt
+    # Широкое покрытие: /24-подсети, где >= min_percent адресов реально отвечают с симки.
+    - type: twl_subnets
+      name: twl-subnets
+      url: https://raw.githubusercontent.com/openlibrecommunity/twl/main/code/subnet/out/subnets.c.json
+      min_percent: 50
+    # Большое legacy-покрытие (CIDR + IP). Обновляется реже — держим как дополнение.
     - type: github
       name: hxehex-cidr
       url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/cidrwhitelist.txt
     - type: github
       name: hxehex-ip
       url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/ipwhitelist.txt
-  refresh_ttl_hours: 24
+  refresh_ttl_hours: 12
 
 orchestrator:
   max_attempts: 30
@@ -31,12 +41,12 @@ hosters:
 
   - name: regru-msk
     type: regru
-    enabled: false              # Phase 3
+    enabled: true
     token_env: REGRU_TOKEN
     size: cloud-1
     image: ubuntu-22-04-amd64
     region_slug: msk1
-    ssh_key_fingerprints: []
+    ssh_key_fingerprints: []    # пусто = ключ wlfinder зальётся автоматически
 
   - name: selectel-spb
     type: selectel

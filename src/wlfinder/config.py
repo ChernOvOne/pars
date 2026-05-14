@@ -38,15 +38,17 @@ class GeneralConfig(BaseModel):
 
 
 class WhitelistSourceConfig(BaseModel):
-    type: Literal["github", "file"]
+    type: Literal["github", "file", "twl_subnets"]
     name: str
     url: str | None = None
     path: Path | None = None
+    # twl_subnets only: keep /24s where >= this % of IPs are confirmed responding.
+    min_percent: float = 0.0
 
     @model_validator(mode="after")
     def _check_target(self) -> WhitelistSourceConfig:
-        if self.type == "github" and not self.url:
-            raise ValueError(f"whitelist source {self.name!r}: github type needs 'url'")
+        if self.type in ("github", "twl_subnets") and not self.url:
+            raise ValueError(f"whitelist source {self.name!r}: {self.type} type needs 'url'")
         if self.type == "file" and not self.path:
             raise ValueError(f"whitelist source {self.name!r}: file type needs 'path'")
         return self

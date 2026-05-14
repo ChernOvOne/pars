@@ -26,6 +26,8 @@ def _fast_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _instant(_: float) -> None:
         return None
 
+    # retries live in _http; the IP-polling loop sleeps in timeweb itself.
+    monkeypatch.setattr("wlfinder.hosters._http.asyncio.sleep", _instant)
     monkeypatch.setattr("wlfinder.hosters.timeweb.asyncio.sleep", _instant)
 
 

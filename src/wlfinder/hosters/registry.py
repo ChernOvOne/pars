@@ -9,17 +9,18 @@ import httpx
 
 from wlfinder.config import Config, HosterConfig
 from wlfinder.hosters.base import Hoster
+from wlfinder.hosters.regru import RegruHoster
 from wlfinder.hosters.timeweb import TimewebHoster
 
 HosterBuilder = Callable[[dict[str, Any], httpx.AsyncClient], Hoster]
 
-# Phase 1 ships Timeweb only; regru/selectel/cloudru/clo/1cloud arrive in Phase 3.
 _BUILDERS: dict[str, HosterBuilder] = {
     "timeweb": TimewebHoster.from_config,
+    "regru": RegruHoster.from_config,
 }
 
 # Hoster types named in the spec that are not implemented yet.
-_PLANNED = {"regru", "selectel", "cloudru", "clo", "1cloud"}
+_PLANNED = {"selectel", "cloudru", "clo", "1cloud"}
 
 
 class UnknownHosterError(RuntimeError):

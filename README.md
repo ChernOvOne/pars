@@ -122,8 +122,12 @@ wlfinder destroy --all --yes     [Phase 4] снести все wlfinder-* сер
   соседний IP 5–30 минут — поэтому `delay_between_attempts_sec` ≥ 10 и
   чередование хостеров/регионов.
 - **Статистика.** `wlfinder stats` — hit-rate по хостерам из SQLite.
-- **Новый источник whitelist.** Добавьте запись в `whitelist.sources`
-  (`type: github` с `url`, либо `type: file` с `path`).
+- **Новый источник whitelist.** Добавьте запись в `whitelist.sources`:
+  `type: github` (raw-текст с IP/CIDR по строке, `url`), `type: file`
+  (локальный файл, `path`) или `type: twl_subnets` (JSON-подсети
+  openlibrecommunity/twl, `url` + `min_percent` — порог доли проверенных IP).
+  По умолчанию основной источник — `openlibrecommunity/twl` (проверенные IP,
+  обновляется ~ежедневно); `hxehex/*` подключён как дополнительное покрытие.
 
 ## Разработка
 

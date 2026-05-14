@@ -17,6 +17,7 @@ from wlfinder.config import WhitelistConfig, WhitelistSourceConfig
 from wlfinder.whitelist.base import WhitelistSource
 from wlfinder.whitelist.file_source import FileSource
 from wlfinder.whitelist.github_source import GitHubSource
+from wlfinder.whitelist.twl_source import TwlSubnetsSource
 
 log = structlog.get_logger(__name__)
 
@@ -166,6 +167,9 @@ def _build_sources(
         if s.type == "github":
             assert s.url is not None  # guaranteed by WhitelistSourceConfig validator
             built.append(GitHubSource(s.name, s.url, client))
+        elif s.type == "twl_subnets":
+            assert s.url is not None
+            built.append(TwlSubnetsSource(s.name, s.url, client, s.min_percent))
         elif s.type == "file":
             assert s.path is not None
             built.append(FileSource(s.name, s.path))

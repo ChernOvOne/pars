@@ -74,3 +74,33 @@ async def test_store_serves_from_cache_within_ttl(tmp_path) -> None:
         checker = await store.get_checker()
         assert route.call_count == 1
         assert checker.is_whitelisted("9.0.0.1")
+
+
+@respx.mock
+async def test_twl_subnets_source_filters_by_percent(tmp_path) -> None:
+    respx.get("https://example.test/subnets.json").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"cidr": "10.0.0.0/24", "percent": 80.0, "ips": []},
+                {"cidr": "10.0.1.0/24", "percent": 20.0, "ips": []},
+                {"cidr": "10.0.2.0/24", "percent": 55.0, "ips": []},
+                {"count": 1, "percent": 99.0},  # malformed entry — no cidr, skipped
+            ],
+        )
+    )
+    cfg = _cfg(
+        {
+            "type": "twl_subnets",
+            "name": "twl",
+            "url": "https://example.test/subnets.json",
+            "min_percent": 50,
+        }
+    )
+    async with httpx.AsyncClient() as client:
+        store = WhitelistStore(cfg, tmp_path, client)
+        checker = await store.get_checker(force=True)
+
+    assert checker.is_whitelisted("10.0.0.5")  # 80% >= 50
+    assert checker.is_whitelisted("10.0.2.5")  # 55% >= 50
+    assert not checker.is_whitelisted("10.0.1.5")  # 20% < 50

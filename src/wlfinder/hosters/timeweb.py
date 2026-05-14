@@ -14,20 +14,14 @@ import structlog
 from pydantic import BaseModel, ConfigDict
 
 from wlfinder.config import resolve_secret
-from wlfinder.hosters.base import (
-    BalanceError,
-    CreatedServer,
-    HosterAuthError,
-    HosterError,
-    RateLimitError,
-)
+from wlfinder.hosters._http import request_with_retries
+from wlfinder.hosters.base import CreatedServer, HosterError
 
 log = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.timeweb.cloud/api/v1"
 _IP_POLL_INTERVAL = 2.0
 _IP_POLL_TIMEOUT = 60.0
-_MAX_RETRIES = 4
 _HOURS_PER_MONTH = 720  # Timeweb presets are priced per month.
 
 
@@ -67,7 +61,6 @@ class TimewebHoster:
             "Content-Type": "application/json",
         }
 
-    # ------------------------------------------------------------------ http
     async def _request(
         self,
         method: str,
@@ -76,39 +69,15 @@ class TimewebHoster:
         json: dict[str, Any] | None = None,
         ok: tuple[int, ...] = (200, 201, 204),
     ) -> httpx.Response:
-        """Issue a request, retrying 429/5xx with exponential backoff.
-
-        Retries are internal, so a 429 never bubbles up as an attempt
-        (spec §15.5). Tokens are never logged — only method/path/status.
-        """
-        url = f"{_BASE_URL}{path}"
-        delay = 1.0
-        for attempt in range(_MAX_RETRIES + 1):
-            resp = await self._client.request(method, url, json=json, headers=self._headers)
-            status = resp.status_code
-            log.debug("timeweb.request", method=method, path=path, status=status)
-
-            if status == 429 or status >= 500:
-                if attempt < _MAX_RETRIES:
-                    sleep_for = _retry_after(resp, delay)
-                    log.warning("timeweb.retry", path=path, status=status, sleep=sleep_for)
-                    await asyncio.sleep(sleep_for)
-                    delay *= 2
-                    continue
-                if status == 429:
-                    raise RateLimitError(f"timeweb: rate limited on {path}")
-                raise HosterError(f"timeweb: server error {status} on {path}")
-
-            if status in (401, 403):
-                raise HosterAuthError(f"timeweb: token rejected ({status})")
-            if status == 402:
-                raise BalanceError("timeweb: insufficient balance (HTTP 402)")
-            if status not in ok:
-                raise HosterError(
-                    f"timeweb: unexpected {status} on {path}: {_safe_body(resp)}"
-                )
-            return resp
-        raise HosterError(f"timeweb: retries exhausted on {path}")  # pragma: no cover
+        return await request_with_retries(
+            self._client,
+            method,
+            f"{_BASE_URL}{path}",
+            headers=self._headers,
+            json=json,
+            ok=ok,
+            label="timeweb",
+        )
 
     # ------------------------------------------------------------- ssh keys
     async def _ensure_ssh_key(self, ssh_pub_key: str) -> int:
@@ -187,38 +156,13 @@ class TimewebHoster:
         return None, None, server
 
     async def delete(self, server_id: str) -> None:
-        """Delete a server. Idempotent: a 404 (already gone) is success."""
-        delay = 1.0
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                resp = await self._client.request(
-                    "DELETE",
-                    f"{_BASE_URL}/servers/{server_id}",
-                    headers=self._headers,
-                )
-            except httpx.HTTPError as exc:
-                if attempt >= _MAX_RETRIES:
-                    raise HosterError(f"timeweb: delete {server_id} failed: {exc}") from exc
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-
-            if resp.status_code in (200, 202, 204, 404):
-                log.info("timeweb.deleted", server_id=server_id, status=resp.status_code)
-                return
-            if resp.status_code >= 500 and attempt < _MAX_RETRIES:
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-            raise HosterError(f"timeweb: delete {server_id} returned {resp.status_code}")
-        raise HosterError(  # pragma: no cover
-            f"timeweb: delete {server_id} retries exhausted"
-        )
+        """Delete a server. Idempotent: a 404 (already gone) counts as success."""
+        resp = await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
+        log.info("timeweb.deleted", server_id=server_id, status=resp.status_code)
 
     async def health_check(self) -> bool:
         resp = await self._request("GET", "/account/status")
-        balance = _extract_balance(resp.json())
-        log.info("timeweb.health", hoster=self.name, balance=balance)
+        log.info("timeweb.health", hoster=self.name, balance=_extract_balance(resp.json()))
         return True
 
     async def get_balance(self) -> float | None:
@@ -237,21 +181,6 @@ class TimewebHoster:
 
 
 # --------------------------------------------------------------------- helpers
-def _retry_after(resp: httpx.Response, fallback: float) -> float:
-    raw = resp.headers.get("Retry-After")
-    if raw:
-        try:
-            return min(float(raw), 30.0)
-        except ValueError:
-            pass
-    return min(fallback, 30.0)
-
-
-def _safe_body(resp: httpx.Response) -> str:
-    text = resp.text
-    return text[:300] if text else "<empty>"
-
-
 def _extract_ip(server: dict[str, Any], family: Literal["ipv4", "ipv6"]) -> str | None:
     """Pull the first public IP of *family* out of a Timeweb server object."""
     for net in server.get("networks", []):
