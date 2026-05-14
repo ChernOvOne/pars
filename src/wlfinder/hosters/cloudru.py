@@ -1,24 +1,19 @@
-"""Cloud.ru Evolution hoster integration.
+"""Cloud.ru Evolution hoster integration — floating-IP roulette.
 
-The real Cloud.ru Compute API is REST — the spec's gRPC-ish
-``/compute/v1/instances`` sketch was wrong. Verified against the public
-API reference and a working client (Emilmeister/openclaw-skills):
+Like Timeweb, wlfinder's roulette here runs on **floating IPs**: a
+floating IPv4 can be allocated standalone (no VM at all) via
+``POST /api/v1/floating-ips``, its address checked against the whitelist,
+and released. Cloud.ru floating IPs pass through a ``creating`` state
+(~40 s) before they become ``available`` (and deletable), so ``create()``
+waits for that.
 
-  auth:    POST https://iam.api.cloud.ru/api/v1/auth/token  {keyId, secret}
-           -> {"access_token": ...}
-  compute: https://compute.api.cloud.ru/api/v1[.1]/...  (Bearer auth)
-
-A Cloud.ru VM only gets a *private* IP on creation. The public IPv4 comes
-from a **floating IP** allocated from Cloud.ru's pool and attached to the
-VM's network interface — so ``create()`` does: create VM -> wait for an
-interface -> allocate a floating IP, and that floating IP is the
-``public_ipv4`` wlfinder checks against the whitelist.
+Auth: a service-account key (Key ID + Key Secret) exchanged for a Bearer
+token at iam.api.cloud.ru.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import uuid
 from typing import Any, Literal
 
@@ -35,24 +30,18 @@ log = structlog.get_logger(__name__)
 
 _IAM_URL = "https://iam.api.cloud.ru"
 _COMPUTE_URL = "https://compute.api.cloud.ru"
-_POLL_INTERVAL = 4.0
-
-# Cloud.ru rejects deletes while a resource is mid-transition (HTTP 422
-# "*_can_not_be_deleted_from_current_state"). delete() waits for the VM to
-# settle into a stable state, then retries the deletes through the 422.
-# Anything not in this set (transitional states, a momentary null state) is
-# treated as "keep waiting".
-_STABLE_STATES = frozenset({"running", "stopped", "active"})
-_DELETE_RETRIES = 12
+_POLL_INTERVAL = 5.0
+# A Cloud.ru floating IP is only stable / deletable once it leaves "creating".
+_STABLE_STATES = frozenset({"available", "active", "in_use", "bound"})
+_DELETE_RETRIES = 8
 _DELETE_RETRY_DELAY = 8.0
 
 
 class CloudRuConfig(BaseModel):
     """The slice of ``config.yaml`` that a Cloud.ru hoster needs.
 
-    ``flavor`` / ``image`` / ``zone`` / ``subnet`` are *names* — list the
-    available ones via the API (GET /api/v1/flavors, /images, /subnets,
-    /availability-zones) or the console.
+    wlfinder allocates *floating IPs* here — only the credentials, project
+    and availability zone are needed for the roulette.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -63,20 +52,12 @@ class CloudRuConfig(BaseModel):
     key_id_env: str = "CLOUDRU_KEY_ID"
     key_secret_env: str = "CLOUDRU_KEY_SECRET"
     project_id_env: str = "CLOUDRU_PROJECT_ID"
-    flavor: str = "lowcost10-1-1"  # flavor_name
-    image: str = "ubuntu-22.04"  # image_name
-    zone: str = "ru.AZ-1"  # availability_zone_name
-    subnet: str = "default"  # subnet_name
-    disk_type: str = "SSD"
-    disk_size: int = 10  # GB
-    # How long create() / delete() wait for a VM to leave a transitional
-    # state (creating -> running). Cloud.ru provisioning is usually 1-2 min;
-    # raise this if your project provisions slowly.
-    create_timeout_sec: int = 600
+    availability_zone: str = "ru.AZ-1"  # availability_zone_name
+    create_timeout_sec: int = 300  # how long to wait for a floating IP to settle
 
 
 class CloudRuHoster:
-    """Thin async client over the Cloud.ru Evolution Compute REST API."""
+    """Floating-IP roulette client over the Cloud.ru Evolution REST API."""
 
     def __init__(self, cfg: CloudRuConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
@@ -118,7 +99,7 @@ class CloudRuHoster:
         method: str,
         path: str,
         *,
-        json: Any = None,
+        json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         ok: tuple[int, ...] = (200, 201, 202, 204),
     ) -> httpx.Response:
@@ -150,144 +131,94 @@ class CloudRuHoster:
         ssh_pub_key: str,
         user_data: str | None,
     ) -> CreatedServer:
-        payload: dict[str, Any] = {
-            "project_id": self._project,
+        """Allocate a standalone floating IPv4. ``ssh_pub_key``/``user_data``
+        are unused — no VM is created, only an IP to test."""
+        body: dict[str, Any] = {
             "name": name,
-            "flavor_name": self._cfg.flavor,
-            "image_name": self._cfg.image,
-            "availability_zone_name": self._cfg.zone,
-            "disks": [
-                {
-                    "name": f"{name}-boot",
-                    "size": self._cfg.disk_size,
-                    "disk_type_name": self._cfg.disk_type,
-                }
-            ],
-            # type is required (regular = normal NIC); new_external_ip asks
-            # Cloud.ru to allocate a public IP for the VM right away.
-            "interfaces": [
-                {
-                    "subnet_name": self._cfg.subnet,
-                    "type": "regular",
-                    "new_external_ip": True,
-                }
-            ],
-            # Required for most images — carries the login + SSH key.
-            "image_metadata": {
-                "name": "wlfinder",
-                "hostname": name,
-                "public_key": ssh_pub_key,
-            },
+            "project_id": self._project,
+            "availability_zone_name": self._cfg.availability_zone,
         }
-        if user_data:
-            payload["cloud_init"] = base64.b64encode(user_data.encode()).decode()
+        resp = await self._request("POST", "/api/v1/floating-ips", json=body, ok=(200, 201, 202))
+        fip = resp.json()
+        fip_id = str(fip["id"])
 
-        # The v1.1 endpoint takes a *list* and returns a *list*.
-        resp = await self._request("POST", "/api/v1.1/vms", json=[payload], ok=(200, 201, 202))
-        body = resp.json()
-        vm = body[0] if isinstance(body, list) else body
-        vm_id = str(vm["id"])
-
-        public_ipv4, raw_vm = await self._wait_for_public_ip(vm_id)
-        if public_ipv4 is None:
+        ip, raw = await self._wait_available(fip_id, fip.get("ip_address"))
+        if not ip:
+            await self._safe_release(fip_id)
             raise HosterError(
-                f"cloudru: VM {vm_id} got no public IPv4 within "
+                f"cloudru: floating IP {fip_id} got no address within "
                 f"{self._cfg.create_timeout_sec}s"
             )
-
         return CreatedServer(
             hoster=self.name,
-            server_id=vm_id,
-            public_ipv4=public_ipv4,
-            region=self._cfg.zone,
-            raw=raw_vm,
+            server_id=fip_id,
+            public_ipv4=str(ip),
+            region=self._cfg.availability_zone,
+            raw=raw,
         )
 
-    async def _wait_for_public_ip(self, vm_id: str) -> tuple[str | None, dict[str, Any]]:
-        """Poll the VM until its interface carries a floating (public) IPv4."""
+    async def _wait_available(
+        self, fip_id: str, ip: str | None
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Poll the floating IP until it leaves the transient 'creating' state."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + self._cfg.create_timeout_sec
-        vm: dict[str, Any] = {}
+        raw: dict[str, Any] = {}
         while loop.time() < deadline:
-            await asyncio.sleep(_POLL_INTERVAL)
-            resp = await self._request("GET", f"/api/v1/vms/{vm_id}")
-            vm = resp.json()
-            state = str(vm.get("state", ""))
+            resp = await self._request("GET", f"/api/v1/floating-ips/{fip_id}")
+            raw = resp.json()
+            ip = raw.get("ip_address") or ip
+            state = str(raw.get("state", ""))
+            if state in _STABLE_STATES:
+                return ip, raw
             if state.startswith("error"):
-                raise HosterError(f"cloudru: VM {vm_id} entered state {state!r}")
-            ip = _public_ip(vm)
-            if ip is not None:
-                return ip, vm
-        return None, vm
+                raise HosterError(f"cloudru: floating IP {fip_id} entered state {state!r}")
+            await asyncio.sleep(_POLL_INTERVAL)
+        return ip, raw  # timed out — return whatever we have
 
     async def delete(self, server_id: str) -> None:
-        """Delete a VM, releasing its floating IP first.
+        """Release a floating IP. ``server_id`` is the floating-IP id.
 
-        Cloud.ru rejects deletes while a resource is still transitioning
-        (e.g. ``creating``), so this waits for the VM to settle and retries
-        the deletes through the resulting 422s.
+        Cloud.ru rejects deletes of a floating IP still in 'creating' with a
+        422, so this retries through that.
         """
-        vm = await self._wait_deletable(server_id)
-        if vm is None:
-            log.info("cloudru.deleted", server_id=server_id, status="already-gone")
-            return
-        for iface in vm.get("interfaces", []):
-            fip = iface.get("floating_ip")
-            if isinstance(fip, dict) and fip.get("id"):
-                await self._delete_retrying_state(f"/api/v1/floating-ips/{fip['id']}")
-        await self._delete_retrying_state(f"/api/v1/vms/{server_id}")
-        log.info("cloudru.deleted", server_id=server_id)
-
-    async def _wait_deletable(self, server_id: str) -> dict[str, Any] | None:
-        """Poll the VM until it leaves a transitional state.
-
-        Returns the VM body, or None if it is already gone / being deleted.
-        """
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + self._cfg.create_timeout_sec
-        vm: dict[str, Any] = {}
-        while loop.time() < deadline:
-            resp = await self._request("GET", f"/api/v1/vms/{server_id}", ok=(200, 404))
-            if resp.status_code == 404:
-                return None
-            vm = resp.json()
-            state = vm.get("state")
-            if state == "deleting":
-                return None
-            if state in _STABLE_STATES or (
-                isinstance(state, str) and state.startswith("error")
-            ):
-                return vm
-            # None / transitional / unknown state -> keep waiting
-            await asyncio.sleep(_POLL_INTERVAL)
-        return vm  # timed out — still attempt the delete with the latest body
-
-    async def _delete_retrying_state(self, path: str) -> None:
-        """DELETE *path*, retrying through 'can not be deleted from current state'."""
         for attempt in range(_DELETE_RETRIES + 1):
-            resp = await self._request("DELETE", path, ok=(200, 202, 204, 404, 422))
+            resp = await self._request(
+                "DELETE", f"/api/v1/floating-ips/{server_id}", ok=(200, 202, 204, 404, 422)
+            )
             if resp.status_code != 422:
+                log.info("cloudru.released", floating_ip_id=server_id, status=resp.status_code)
                 return
-            if "current_state" not in resp.text and "current state" not in resp.text:
-                raise HosterError(f"cloudru: unexpected 422 on DELETE {path}: {resp.text[:200]}")
             if attempt < _DELETE_RETRIES:
                 await asyncio.sleep(_DELETE_RETRY_DELAY)
-        raise HosterError(f"cloudru: {path} still not deletable after retries")
+        raise HosterError(f"cloudru: floating IP {server_id} not deletable after retries")
+
+    async def _safe_release(self, fip_id: str) -> None:
+        try:
+            await self.delete(fip_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            log.error("cloudru.cleanup_failed", floating_ip_id=fip_id, error=str(exc))
 
     async def list_servers(self) -> list[ServerInfo]:
-        resp = await self._request("GET", "/api/v1/vms", params={"project_id": self._project})
+        resp = await self._request(
+            "GET", "/api/v1/floating-ips", params={"project_id": self._project}
+        )
         data = resp.json()
         items = data.get("items", []) if isinstance(data, dict) else data
-        return [
-            ServerInfo(
-                hoster=self.name,
-                server_id=str(vm["id"]),
-                name=str(vm.get("name", "")),
-                public_ipv4=_public_ip(vm),
-                region=self._cfg.zone,
+        out: list[ServerInfo] = []
+        for fip in items:
+            zone = fip.get("availability_zone")
+            zone_name = zone.get("name") if isinstance(zone, dict) else None
+            out.append(
+                ServerInfo(
+                    hoster=self.name,
+                    server_id=str(fip["id"]),
+                    name=str(fip.get("name", "")),
+                    public_ipv4=fip.get("ip_address"),
+                    region=str(zone_name or self._cfg.availability_zone),
+                )
             )
-            for vm in items
-        ]
+        return out
 
     async def health_check(self) -> bool:
         await self._ensure_token()
@@ -299,13 +230,4 @@ class CloudRuHoster:
         return None  # Cloud.ru billing is a separate API.
 
     async def estimate_cost_per_hour(self) -> float | None:
-        return None
-
-
-def _public_ip(vm: dict[str, Any]) -> str | None:
-    """The VM's floating (public) IPv4, if one is attached."""
-    for iface in vm.get("interfaces", []):
-        fip = iface.get("floating_ip")
-        if isinstance(fip, dict) and fip.get("ip_address"):
-            return str(fip["ip_address"])
-    return None
+        return None  # floating IPs are cheap and billed separately
