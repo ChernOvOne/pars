@@ -72,6 +72,7 @@ hosters:
     subnet: default             # subnet_name  — список: GET /api/v1/subnets
     disk_type: SSD
     disk_size: 10
+    create_timeout_sec: 600     # сколько ждать поднятия ВМ (Cloud.ru бывает медленным)
 
   - name: clo-msk
     type: clo

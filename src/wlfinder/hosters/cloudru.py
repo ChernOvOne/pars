@@ -36,7 +36,6 @@ log = structlog.get_logger(__name__)
 _IAM_URL = "https://iam.api.cloud.ru"
 _COMPUTE_URL = "https://compute.api.cloud.ru"
 _POLL_INTERVAL = 4.0
-_POLL_TIMEOUT = 300.0
 
 # Cloud.ru rejects deletes while a resource is mid-transition (HTTP 422
 # "*_can_not_be_deleted_from_current_state"). delete() waits for the VM to
@@ -70,6 +69,10 @@ class CloudRuConfig(BaseModel):
     subnet: str = "default"  # subnet_name
     disk_type: str = "SSD"
     disk_size: int = 10  # GB
+    # How long create() / delete() wait for a VM to leave a transitional
+    # state (creating -> running). Cloud.ru provisioning is usually 1-2 min;
+    # raise this if your project provisions slowly.
+    create_timeout_sec: int = 600
 
 
 class CloudRuHoster:
@@ -188,7 +191,8 @@ class CloudRuHoster:
         public_ipv4, raw_vm = await self._wait_for_public_ip(vm_id)
         if public_ipv4 is None:
             raise HosterError(
-                f"cloudru: VM {vm_id} got no public IPv4 within {_POLL_TIMEOUT:.0f}s"
+                f"cloudru: VM {vm_id} got no public IPv4 within "
+                f"{self._cfg.create_timeout_sec}s"
             )
 
         return CreatedServer(
@@ -202,7 +206,7 @@ class CloudRuHoster:
     async def _wait_for_public_ip(self, vm_id: str) -> tuple[str | None, dict[str, Any]]:
         """Poll the VM until its interface carries a floating (public) IPv4."""
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + _POLL_TIMEOUT
+        deadline = loop.time() + self._cfg.create_timeout_sec
         vm: dict[str, Any] = {}
         while loop.time() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -240,7 +244,7 @@ class CloudRuHoster:
         Returns the VM body, or None if it is already gone / being deleted.
         """
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + _POLL_TIMEOUT
+        deadline = loop.time() + self._cfg.create_timeout_sec
         vm: dict[str, Any] = {}
         while loop.time() < deadline:
             resp = await self._request("GET", f"/api/v1/vms/{server_id}", ok=(200, 404))
