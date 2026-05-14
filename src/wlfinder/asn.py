@@ -25,12 +25,18 @@ _IPVERSE_URL = (
 )
 _CACHE_TTL_SECONDS = 7 * 24 * 3600  # BGP announcements change slowly.
 
-# Default hoster-type -> ASNs (spec §10; verify periodically, these can change).
+# Default hoster-type -> ASNs. Verified May 2026 via RIPEstat — the spec §10
+# list was largely wrong (it assigned REG.RU's, G-Core's and an Austrian
+# company's ASNs to the wrong hosters). clo / 1cloud are best-effort: their
+# customer VPS pools are not cleanly published, so override with an `asns:`
+# list in config.yaml if you know better. Numbers drift — re-verify yearly.
 DEFAULT_ASNS: dict[str, list[int]] = {
-    "timeweb": [9123, 197695],
-    "regru": [197695, 47593],
-    "selectel": [49505, 50340],
-    "cloudru": [199524, 209156],
+    "timeweb": [9123, 51789],                    # TimeWeb-AS, TimewebCloud
+    "regru": [197695],                           # AS-REGRU
+    "selectel": [49505, 50340, 61976, 198652],   # SELECTEL{,-MSK,-NSK,-AS}
+    "cloudru": [208677],                         # CLOUDRU-AS (Cloud Technologies LLC)
+    "clo": [29182],                              # JSC IOT — clo.ru / api.clo.ru
+    "1cloud": [48096, 51115],                    # ITGRAD Enterprise Cloud + HLL-AS
 }
 
 
