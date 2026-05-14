@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import structlog
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -61,6 +62,9 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def _load_config(config: Path) -> Config:
+    # Load secrets from a .env next to config.yaml. Real environment variables
+    # still win — load_dotenv does not override existing os.environ entries.
+    load_dotenv(Path(config).expanduser().with_name(".env"))
     try:
         cfg = Config.load(config)
     except FileNotFoundError as exc:
@@ -102,28 +106,37 @@ def _main(
 
 
 # --------------------------------------------------------------------------- init
-def _example_config_text() -> str:
-    """Read the bundled config.example.yaml (packaged inside wlfinder)."""
-    return (
-        resources.files("wlfinder")
-        .joinpath("config.example.yaml")
-        .read_text(encoding="utf-8")
-    )
+def _bundled(name: str) -> str:
+    """Read a file bundled inside the wlfinder package."""
+    return resources.files("wlfinder").joinpath(name).read_text(encoding="utf-8")
 
 
 def do_init(config: Path, *, force: bool) -> None:
-    """Write config.example.yaml -> config. Shared by the `init` command and menu."""
+    """Create config.yaml plus a .env template next to it.
+
+    Shared by the `init` command and the interactive menu.
+    """
     if config.exists() and not force:
         console.print(f"[yellow]{config} already exists[/yellow] (use --force to overwrite)")
         raise typer.Exit(1)
     try:
-        text = _example_config_text()
+        config.write_text(_bundled("config.example.yaml"), encoding="utf-8")
     except (FileNotFoundError, ModuleNotFoundError) as exc:
         console.print("[red]bundled config.example.yaml is missing[/red]")
         raise typer.Exit(1) from exc
-    config.write_text(text, encoding="utf-8")
+    console.print(f"[green]wrote {config.resolve()}[/green]")
+
+    env_path = config.with_name(".env")
+    if env_path.exists():
+        console.print(f"[dim].env already exists ({env_path.resolve()}) — left as-is[/dim]")
+    else:
+        try:
+            env_path.write_text(_bundled(".env.example"), encoding="utf-8")
+            console.print(f"[green]wrote {env_path.resolve()}[/green] — put your tokens here")
+        except (FileNotFoundError, ModuleNotFoundError):
+            console.print("[yellow].env template missing — create .env manually[/yellow]")
     console.print(
-        f"[green]wrote {config.resolve()}[/green] — edit it, then set tokens in .env"
+        "[dim]next: fill .env with tokens and edit config.yaml — `pars tokens` for help[/dim]"
     )
 
 

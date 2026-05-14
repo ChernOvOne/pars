@@ -1,6 +1,6 @@
 [project]
 name = "wlfinder"
-version = "0.1.0"
+version = "0.2.0"
 description = "IP-roulette: find a Russian-hoster VPS whose IPv4 sits in the mobile-operator whitelist, then keep it."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ dependencies = [
     "structlog>=24.4",
     "aiosqlite>=0.20",
     "pyyaml>=6.0",
-    "jinja2>=3.1",
+    "python-dotenv>=1.0",
     "cryptography>=43.0",
 ]
 
@@ -40,8 +40,9 @@ build-backend = "hatchling.build"
 packages = ["src/wlfinder"]
 
 [tool.hatch.build.targets.wheel.force-include]
-# Bundle the token-setup guide so `pars tokens` works on tool installs.
+# Bundle docs/templates so `pars tokens` / `pars init` work on tool installs.
 "docs/tokens.md" = "wlfinder/tokens.md"
+".env.example" = "wlfinder/.env.example"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
