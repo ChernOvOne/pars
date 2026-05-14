@@ -188,6 +188,33 @@ async def test_get_balance(hoster: TimewebHoster) -> None:
 
 
 @respx.mock
+async def test_list_servers(hoster: TimewebHoster) -> None:
+    respx.get(f"{API}/servers").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "servers": [
+                    {
+                        "id": 1,
+                        "name": "wlfinder-20260514-101010",
+                        "networks": [
+                            {"type": "public", "ips": [{"type": "ipv4", "ip": "1.2.3.4"}]}
+                        ],
+                    },
+                    {"id": 2, "name": "my-other-vps", "networks": []},
+                ]
+            },
+        )
+    )
+    servers = await hoster.list_servers()
+    assert {s.server_id for s in servers} == {"1", "2"}
+    wl = [s for s in servers if s.name.startswith("wlfinder-")]
+    assert len(wl) == 1
+    assert wl[0].public_ipv4 == "1.2.3.4"
+    assert wl[0].hoster == "timeweb-spb"
+
+
+@respx.mock
 async def test_estimate_cost_per_hour(hoster: TimewebHoster) -> None:
     respx.get(f"{API}/presets/servers").mock(
         return_value=httpx.Response(

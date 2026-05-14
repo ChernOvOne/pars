@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from wlfinder.models import CreatedServer
+from wlfinder.models import CreatedServer, ServerInfo
 
 __all__ = [
     "BalanceError",
@@ -13,6 +13,7 @@ __all__ = [
     "HosterAuthError",
     "HosterError",
     "RateLimitError",
+    "ServerInfo",
 ]
 
 
@@ -52,6 +53,10 @@ class Hoster(Protocol):
     ) -> CreatedServer: ...
 
     async def delete(self, server_id: str) -> None: ...
+
+    async def list_servers(self) -> list[ServerInfo]:
+        """Every server currently on the account — used by ``destroy``."""
+        ...
 
     async def health_check(self) -> bool:
         """Ping the API and validate the token. Raises on auth failure."""

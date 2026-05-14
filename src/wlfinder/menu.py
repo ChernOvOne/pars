@@ -29,6 +29,7 @@ _MENU: list[tuple[str, str, str]] = [
     ("7", "Пробный прогон (--dry-run, без создания серверов)", "dry"),
     ("8", "▶  ЗАПУСТИТЬ поиск IP", "run"),
     ("9", "Статистика прошлых запусков", "stats"),
+    ("d", "⚠  Удалить ВСЕ wlfinder-серверы (паник-кнопка)", "destroy"),
     ("0", "Выход", "quit"),
 ]
 
@@ -101,6 +102,10 @@ def _dispatch(action: str, config: Path) -> None:
         asyncio.run(cli._run(cfg, [], None, dry_run=True))
     elif action == "stats":
         asyncio.run(cli._stats(cfg))
+    elif action == "destroy":
+        # _destroy_all lists the servers and then asks for an interactive y/n,
+        # so passing yes=True here still keeps the confirmation step.
+        asyncio.run(cli._destroy_all(cfg, yes=True))
     elif action == "run":
         console.print(
             "[yellow]Внимание:[/yellow] это создаёт реальные VPS у хостеров — "

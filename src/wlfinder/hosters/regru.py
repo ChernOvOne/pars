@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from wlfinder.config import resolve_secret
 from wlfinder.hosters._http import request_with_retries
 from wlfinder.hosters.base import CreatedServer, HosterError
+from wlfinder.models import ServerInfo
 
 log = structlog.get_logger(__name__)
 
@@ -159,6 +160,19 @@ class RegruHoster:
         """Delete a reglet. Idempotent: a 404 (already gone) counts as success."""
         resp = await self._request("DELETE", f"/reglets/{server_id}", ok=(200, 202, 204, 404))
         log.info("regru.deleted", server_id=server_id, status=resp.status_code)
+
+    async def list_servers(self) -> list[ServerInfo]:
+        resp = await self._request("GET", "/reglets")
+        return [
+            ServerInfo(
+                hoster=self.name,
+                server_id=str(reglet["id"]),
+                name=str(reglet.get("name", "")),
+                public_ipv4=_extract_ipv4(reglet),
+                region=self._cfg.region_slug,
+            )
+            for reglet in resp.json().get("reglets", [])
+        ]
 
     async def health_check(self) -> bool:
         # /account/keys is the cheapest authenticated endpoint — validates the token.

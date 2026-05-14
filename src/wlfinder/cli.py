@@ -16,7 +16,9 @@ from wlfinder import __version__
 from wlfinder.asn import AsnOverlap, AsnStore, compute_overlap, resolve_asns
 from wlfinder.config import Config
 from wlfinder.db import Database
+from wlfinder.hosters.base import Hoster
 from wlfinder.hosters.registry import build_hoster
+from wlfinder.models import ServerInfo
 from wlfinder.notifier import NullNotifier, TelegramNotifier, build_notifier
 from wlfinder.orchestrator import NoHitError, Orchestrator
 from wlfinder.whitelist.store import WhitelistStore
@@ -395,16 +397,71 @@ def _print_overlap(o: AsnOverlap) -> None:
     console.print()
 
 
-# ----------------------------------------------------- stubs (later phases)
+# ------------------------------------------------------------------------- destroy
+_WLFINDER_PREFIX = "wlfinder-"
+
+
 @app.command()
 def destroy(
     config: Path = ConfigOption,
     all_: bool = typer.Option(False, "--all", help="Destroy every wlfinder-* server."),
-    yes: bool = typer.Option(False, "--yes", help="Required confirmation flag."),
+    yes: bool = typer.Option(False, "--yes", help="Required: confirm you really mean it."),
 ) -> None:
-    """[Phase 4] Panic button: tear down all wlfinder-* servers."""
-    console.print("[yellow]destroy is not implemented yet (Phase 4)[/yellow]")
-    raise typer.Exit(1)
+    """Panic button: tear down every wlfinder-* server across all hosters."""
+    cfg = _load_config(config)
+    if not all_:
+        console.print("[yellow]destroy currently supports only --all[/yellow]")
+        raise typer.Exit(1)
+    asyncio.run(_destroy_all(cfg, yes))
+
+
+async def _destroy_all(cfg: Config, yes: bool) -> None:
+    found: list[ServerInfo] = []
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        by_name: dict[str, Hoster] = {}
+        for hcfg in cfg.enabled_hosters:
+            try:
+                by_name[hcfg.name] = build_hoster(hcfg, client)
+            except Exception as exc:  # noqa: BLE001 - report, skip this hoster
+                console.print(f"[red]{hcfg.name}: {exc}[/red]")
+
+        for name, hoster in by_name.items():
+            try:
+                servers = await hoster.list_servers()
+            except Exception as exc:  # noqa: BLE001 - report, skip this hoster
+                console.print(f"[red]{name}: list failed: {exc}[/red]")
+                continue
+            found.extend(s for s in servers if s.name.startswith(_WLFINDER_PREFIX))
+
+        if not found:
+            console.print("[green]no wlfinder-* servers found[/green]")
+            return
+
+        table = Table(title=f"{len(found)} wlfinder-* server(s)")
+        table.add_column("hoster")
+        table.add_column("server_id")
+        table.add_column("name")
+        table.add_column("ipv4")
+        for s in found:
+            table.add_row(s.hoster, s.server_id, s.name, s.public_ipv4 or "—")
+        console.print(table)
+
+        # Double confirmation (spec §14): the --yes flag *and* an interactive y/n.
+        if not yes:
+            console.print("[yellow]pass --yes to actually destroy these servers[/yellow]")
+            raise typer.Exit(1)
+        if not typer.confirm(f"Destroy all {len(found)} server(s)? This cannot be undone"):
+            console.print("[dim]aborted[/dim]")
+            return
+
+        destroyed = 0
+        for s in found:
+            try:
+                await by_name[s.hoster].delete(s.server_id)
+                destroyed += 1
+            except Exception as exc:  # noqa: BLE001 - report, keep destroying the rest
+                console.print(f"[red]{s.hoster}/{s.server_id}: {exc}[/red]")
+        console.print(f"[green]destroyed {destroyed}/{len(found)} server(s)[/green]")
 
 
 def main() -> None:

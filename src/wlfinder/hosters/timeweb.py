@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 from wlfinder.config import resolve_secret
 from wlfinder.hosters._http import request_with_retries
 from wlfinder.hosters.base import CreatedServer, HosterError
+from wlfinder.models import ServerInfo
 
 log = structlog.get_logger(__name__)
 
@@ -159,6 +160,19 @@ class TimewebHoster:
         """Delete a server. Idempotent: a 404 (already gone) counts as success."""
         resp = await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
         log.info("timeweb.deleted", server_id=server_id, status=resp.status_code)
+
+    async def list_servers(self) -> list[ServerInfo]:
+        resp = await self._request("GET", "/servers")
+        return [
+            ServerInfo(
+                hoster=self.name,
+                server_id=str(server["id"]),
+                name=str(server.get("name", "")),
+                public_ipv4=_extract_ip(server, "ipv4"),
+                region=self._cfg.region,
+            )
+            for server in resp.json().get("servers", [])
+        ]
 
     async def health_check(self) -> bool:
         resp = await self._request("GET", "/account/status")

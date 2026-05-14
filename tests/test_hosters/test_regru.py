@@ -168,3 +168,24 @@ async def test_health_check_ok(hoster: RegruHoster) -> None:
 async def test_get_balance_is_none(hoster: RegruHoster) -> None:
     # REG.ru CloudVPS has no balance endpoint — must report None, not crash.
     assert await hoster.get_balance() is None
+
+
+@respx.mock
+async def test_list_servers(hoster: RegruHoster) -> None:
+    respx.get(f"{API}/reglets").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "reglets": [
+                    {"id": 10, "name": "wlfinder-x", "ip": "5.6.7.8"},
+                    {"id": 11, "name": "prod-db", "ip": "9.9.9.9"},
+                ]
+            },
+        )
+    )
+    servers = await hoster.list_servers()
+    assert {s.server_id for s in servers} == {"10", "11"}
+    wl = [s for s in servers if s.name.startswith("wlfinder-")]
+    assert len(wl) == 1
+    assert wl[0].public_ipv4 == "5.6.7.8"
+    assert wl[0].region == "msk1"

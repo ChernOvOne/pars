@@ -24,6 +24,16 @@ class CreatedServer(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict, repr=False)
 
 
+class ServerInfo(BaseModel):
+    """A server as seen when listing a hoster account — used by ``destroy``."""
+
+    hoster: str
+    server_id: str
+    name: str
+    public_ipv4: str | None = None
+    region: str | None = None
+
+
 class Attempt(BaseModel):
     """One IP-roulette attempt, persisted to the ``attempts`` table."""
 
