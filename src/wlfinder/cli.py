@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+from ipaddress import IPv4Network
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from wlfinder import __version__
+from wlfinder.asn import AsnOverlap, AsnStore, compute_overlap, resolve_asns
 from wlfinder.config import Config
 from wlfinder.db import Database
 from wlfinder.hosters.registry import build_hoster
@@ -22,10 +24,10 @@ from wlfinder.whitelist.store import WhitelistStore
 console = Console()
 
 app = typer.Typer(
-    name="wlfinder",
+    name="pars",
     help="IP-roulette: find a Russian-hoster VPS whose IPv4 sits in the "
-    "mobile-operator whitelist, then notify the admin over Telegram.",
-    no_args_is_help=True,
+    "mobile-operator whitelist, then notify the admin over Telegram. "
+    "Run `pars` with no arguments for an interactive menu.",
     add_completion=False,
 )
 whitelist_app = typer.Typer(help="Manage whitelist sources and cache.", no_args_is_help=True)
@@ -74,8 +76,9 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _main(
+    ctx: typer.Context,
     version: bool = typer.Option(
         False,
         "--version",
@@ -84,16 +87,20 @@ def _main(
         is_eager=True,
     ),
 ) -> None:
-    """wlfinder — IP-roulette for Russian mobile-operator whitelists."""
+    """pars / wlfinder — IP-roulette for Russian mobile-operator whitelists.
+
+    With no subcommand, launches an interactive menu.
+    """
+    if ctx.invoked_subcommand is None:
+        from wlfinder.menu import run_menu
+
+        run_menu(_DEFAULT_CONFIG)
+        raise typer.Exit()
 
 
 # --------------------------------------------------------------------------- init
-@app.command()
-def init(
-    config: Path = ConfigOption,
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing config.yaml."),
-) -> None:
-    """Copy config.example.yaml -> config.yaml."""
+def do_init(config: Path, *, force: bool) -> None:
+    """Copy config.example.yaml -> config. Shared by the `init` command and menu."""
     example = _find_example()
     if example is None:
         console.print("[red]config.example.yaml not found next to the package[/red]")
@@ -103,6 +110,15 @@ def init(
         raise typer.Exit(1)
     shutil.copyfile(example, config)
     console.print(f"[green]wrote {config}[/green] — edit it, then set tokens in .env")
+
+
+@app.command()
+def init(
+    config: Path = ConfigOption,
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing config.yaml."),
+) -> None:
+    """Copy config.example.yaml -> config.yaml."""
+    do_init(config, force=force)
 
 
 def _find_example() -> Path | None:
@@ -137,11 +153,14 @@ async def _whitelist_update(cfg: Config) -> None:
 @whitelist_app.command("stats")
 def whitelist_stats(config: Path = ConfigOption) -> None:
     """Show the cached whitelist size and per-source breakdown."""
-    cfg = _load_config(config)
-    store = WhitelistStore(cfg.whitelist, cfg.general.cache_dir, httpx.AsyncClient())
+    _whitelist_stats(_load_config(config))
+
+
+def _whitelist_stats(cfg: Config) -> None:
+    store = WhitelistStore(cfg.whitelist, cfg.general.cache_dir)
     cache = store.load_cache()
     if cache is None:
-        console.print("[yellow]no cache yet[/yellow] — run `wlfinder whitelist update`")
+        console.print("[yellow]no cache yet[/yellow] — run `pars whitelist update`")
         raise typer.Exit(1)
     _print_whitelist_table(
         f"whitelist cache (fetched {cache.fetched_at.isoformat()})",
@@ -324,14 +343,59 @@ async def _stats(cfg: Config) -> None:
     console.print(table)
 
 
-# ----------------------------------------------------- stubs (later phases)
+# ----------------------------------------------------------------------- asn-stats
 @app.command("asn-stats")
 def asn_stats(config: Path = ConfigOption) -> None:
-    """[Phase 3] Show hoster-prefix vs whitelist overlap by ASN."""
-    console.print("[yellow]asn-stats is not implemented yet (Phase 3)[/yellow]")
-    raise typer.Exit(1)
+    """Estimate hit probability per hoster: announced prefixes ∩ whitelist."""
+    cfg = _load_config(config)
+    asyncio.run(_asn_stats(cfg))
 
 
+async def _asn_stats(cfg: Config) -> None:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        store = WhitelistStore(cfg.whitelist, cfg.general.cache_dir, client)
+        checker = await store.get_checker()
+        asn_store = AsnStore(cfg.general.cache_dir, client)
+        console.print(f"whitelist: [bold]{checker.network_count}[/bold] networks\n")
+        if not cfg.enabled_hosters:
+            console.print("[yellow]no enabled hosters[/yellow]")
+            return
+        for hcfg in cfg.enabled_hosters:
+            asns = resolve_asns(hcfg.type, hcfg.as_dict())
+            if not asns:
+                console.print(
+                    f"[yellow]{hcfg.name}[/yellow]: ASNs unknown for type "
+                    f"{hcfg.type!r} — add an `asns:` list to its config\n"
+                )
+                continue
+            prefixes: list[IPv4Network] = []
+            for asn in asns:
+                try:
+                    prefixes.extend(await asn_store.fetch_prefixes(asn))
+                except Exception as exc:  # noqa: BLE001 - report, keep going
+                    console.print(f"  [red]AS{asn}: {exc}[/red]")
+            _print_overlap(compute_overlap(hcfg.name, asns, prefixes, checker))
+
+
+def _print_overlap(o: AsnOverlap) -> None:
+    asn_label = ", ".join(f"AS{a}" for a in o.asns)
+    console.print(f"[bold cyan]{o.hoster}[/bold cyan] ({asn_label})")
+    console.print(
+        f"  announced:    {o.announced_addresses:,} addr  "
+        f"(~{o.announced_addresses // 256} ×/24)"
+    )
+    console.print(
+        f"  in whitelist: {o.whitelisted_addresses:,} addr  ([bold]{o.percent:.3f}%[/bold])"
+    )
+    console.print(f"  matched:      {len(o.matched_prefixes)} / {o.total_prefixes} prefixes")
+    if o.matched_prefixes:
+        shown = ", ".join(str(p) for p in o.matched_prefixes[:8])
+        extra = "" if len(o.matched_prefixes) <= 8 else f"  (+{len(o.matched_prefixes) - 8} more)"
+        console.print(f"  e.g.: [dim]{shown}{extra}[/dim]")
+    console.print()
+
+
+# ----------------------------------------------------- stubs (later phases)
 @app.command()
 def destroy(
     config: Path = ConfigOption,

@@ -48,31 +48,51 @@ git clone https://github.com/ChernOvOne/pars && cd pars
 uv venv && uv pip install -e ".[dev]"
 ```
 
-## Первый запуск
+## Интерактивное меню
+
+Самый простой способ — запустить **`pars`** без аргументов: откроется
+понятное меню со всеми действиями (настройка, обновление whitelist, проверка
+хостеров и Telegram, ASN-статистика, пробный прогон, запуск, статистика).
 
 ```bash
-wlfinder init                        # config.example.yaml -> config.yaml
-$EDITOR config.yaml                  # выбрать хостеров, тарифы, регионы, chat_id
-cp .env.example .env && $EDITOR .env # вписать токены хостеров и Telegram-бота
-wlfinder whitelist update            # загрузить и закэшировать whitelist'ы
-wlfinder hoster ping                 # проверить токены / баланс
-wlfinder notify test                 # проверить доставку в Telegram
-wlfinder run                         # запустить IP-roulette
+pars
+```
+
+## Первый запуск
+
+Через меню (`pars` → пункты по порядку) или командами:
+
+```bash
+pars init                        # config.example.yaml -> config.yaml
+$EDITOR config.yaml              # выбрать хостеров, тарифы, регионы, chat_id
+cp .env.example .env && $EDITOR .env  # вписать токены (см. docs/tokens.md)
+pars whitelist update            # загрузить и закэшировать whitelist'ы
+pars hoster ping                 # проверить токены / баланс
+pars notify test                 # проверить доставку в Telegram
+pars asn-stats                   # оценить шансы попадания по хостерам
+pars run                         # запустить IP-roulette
 ```
 
 Безопасная проверка пайплайна без реальных трат:
 
 ```bash
-wlfinder run --dry-run
+pars run --dry-run
 ```
 
+> `pars` и `wlfinder` — одна и та же команда (псевдонимы).
+
 ## Получение токенов
+
+**Пошаговая инструкция по всем ключам — [`docs/tokens.md`](docs/tokens.md)**
+(Timeweb Cloud, REG.ru CloudVPS, Telegram-бот + `chat_id`).
+
+Кратко:
 
 | Что | Где взять |
 |-----|-----------|
 | Timeweb Cloud | Панель → API и терминал → [Токены API](https://timeweb.cloud/my/api-keys) |
-| Telegram-бот | [@BotFather](https://t.me/BotFather) → `/newbot` → токен; `chat_id` — через [@userinfobot](https://t.me/userinfobot) |
-| REG.ru CloudVPS | ЛК → Облачные серверы → Настройки → Токен для API *(Phase 3)* |
+| REG.ru CloudVPS | ЛК → Облачные серверы → Настройки → Токен для API |
+| Telegram-бот | [@BotFather](https://t.me/BotFather) → `/newbot` → токен; `chat_id` — через `getUpdates` или [@userinfobot](https://t.me/userinfobot) |
 
 Токены кладутся **только** в `.env`; в `config.yaml` хранится лишь имя
 переменной окружения (`token_env: TIMEWEB_TOKEN`, `bot_token_env:
@@ -81,17 +101,18 @@ TELEGRAM_BOT_TOKEN`). `config.yaml` и `.env` добавлены в `.gitignore`
 ## CLI
 
 ```
-wlfinder init                    копирует config.example.yaml -> config.yaml
-wlfinder whitelist update        форсит обновление кэша whitelist
-wlfinder whitelist stats         размер кэша, разбивка по источникам
-wlfinder hoster ping             проверка токенов / баланса всех enabled-хостеров
-wlfinder notify test             тестовое сообщение в Telegram
-wlfinder run                     основной IP-roulette
-wlfinder run --dry-run           проверка пайплайна без create
-wlfinder run --hoster timeweb-spb --max-attempts 5
-wlfinder stats                   hit-rate по хостерам из истории SQLite
-wlfinder asn-stats               [Phase 3] пересечение хостеров с whitelist
-wlfinder destroy --all --yes     [Phase 4] снести все wlfinder-* серверы
+pars                          интерактивное меню (без аргументов)
+pars init                     копирует config.example.yaml -> config.yaml
+pars whitelist update         форсит обновление кэша whitelist
+pars whitelist stats          размер кэша, разбивка по источникам
+pars hoster ping              проверка токенов / баланса всех enabled-хостеров
+pars notify test              тестовое сообщение в Telegram
+pars asn-stats                пересечение префиксов хостеров с whitelist (оценка шансов)
+pars run                      основной IP-roulette
+pars run --dry-run            проверка пайплайна без create
+pars run --hoster timeweb-spb --max-attempts 5
+pars stats                    hit-rate по хостерам из истории SQLite
+pars destroy --all --yes      [Phase 4] снести все wlfinder-* серверы
 ```
 
 ## Как это работает

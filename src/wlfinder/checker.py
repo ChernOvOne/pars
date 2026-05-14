@@ -54,3 +54,34 @@ class WhitelistChecker:
         if idx < 0:
             return False
         return addr in nets[idx]
+
+    def count_overlap(self, network: IPv4Network | IPv6Network) -> int:
+        """Count addresses of *network* that fall inside the whitelist.
+
+        Used by ``asn-stats`` to estimate the hit probability for a hoster:
+        ``count_overlap / network.num_addresses`` over its announced prefixes.
+        """
+        if network.version == 4:
+            nets: list[IPv4Network] | list[IPv6Network] = self._v4
+            starts = self._v4_starts
+        else:
+            nets = self._v6
+            starts = self._v6_starts
+        if not nets:
+            return 0
+        lo = int(network.network_address)
+        hi = int(network.broadcast_address)
+        total = 0
+        # Walk back from the rightmost whitelist net that could reach into
+        # [lo, hi]; stop once a net ends before lo (sorted + non-overlapping).
+        i = bisect.bisect_right(starts, hi) - 1
+        while i >= 0:
+            wl = nets[i]
+            wl_hi = int(wl.broadcast_address)
+            if wl_hi < lo:
+                break
+            overlap = min(wl_hi, hi) - max(int(wl.network_address), lo) + 1
+            if overlap > 0:
+                total += overlap
+            i -= 1
+        return total

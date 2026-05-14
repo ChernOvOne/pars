@@ -29,6 +29,7 @@ dev = [
 ]
 
 [project.scripts]
+pars = "wlfinder.cli:main"
 wlfinder = "wlfinder.cli:main"
 
 [build-system]

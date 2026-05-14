@@ -59,3 +59,19 @@ def test_overlapping_and_adjacent_collapse() -> None:
 def test_whitespace_tolerated() -> None:
     c = _checker("10.0.0.0/8")
     assert c.is_whitelisted("  10.0.0.1  ")
+
+
+def test_count_overlap() -> None:
+    c = _checker("10.0.0.0/25", "10.0.2.0/24")
+    # /24 fully containing a whitelisted /25
+    assert c.count_overlap(ip_network("10.0.0.0/24")) == 128
+    # /23 spanning a /25 and a full /24
+    assert c.count_overlap(ip_network("10.0.2.0/23")) == 256
+    # no overlap at all
+    assert c.count_overlap(ip_network("172.16.0.0/24")) == 0
+    # announced prefix smaller than the whitelisted network
+    assert c.count_overlap(ip_network("10.0.0.0/26")) == 64
+
+
+def test_count_overlap_empty_checker() -> None:
+    assert WhitelistChecker([]).count_overlap(ip_network("10.0.0.0/24")) == 0
