@@ -10,6 +10,7 @@ import httpx
 import structlog
 import typer
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.table import Table
 
 from wlfinder import __version__
@@ -133,6 +134,20 @@ def init(
 ) -> None:
     """Create config.yaml from the bundled template."""
     do_init(config, force=force)
+
+
+@app.command()
+def tokens() -> None:
+    """Show step-by-step instructions for obtaining API keys / tokens."""
+    try:
+        text = resources.files("wlfinder").joinpath("tokens.md").read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        console.print(
+            "[yellow]bundled guide not found[/yellow] — see docs/tokens.md at "
+            "https://github.com/ChernOvOne/pars"
+        )
+        raise typer.Exit(1) from exc
+    console.print(Markdown(text))
 
 
 # ---------------------------------------------------------------------- whitelist

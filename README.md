@@ -88,8 +88,9 @@ pars run --dry-run
 
 ## Получение токенов
 
-**Пошаговая инструкция по всем ключам — [`docs/tokens.md`](docs/tokens.md)**
-(Timeweb Cloud, REG.ru CloudVPS, Telegram-бот + `chat_id`).
+**Пошаговая инструкция по всем ключам:** команда **`pars tokens`** (показывает
+гайд прямо в терминале) или файл [`docs/tokens.md`](docs/tokens.md) — Timeweb
+Cloud, REG.ru CloudVPS, Selectel, Cloud.ru, CLO.ru, 1cloud, Telegram-бот + `chat_id`.
 
 Кратко:
 

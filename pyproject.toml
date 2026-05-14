@@ -39,6 +39,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/wlfinder"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# Bundle the token-setup guide so `pars tokens` works on tool installs.
+"docs/tokens.md" = "wlfinder/tokens.md"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

@@ -21,6 +21,7 @@ console = Console()
 # (key, label, action) — order is the on-screen order.
 _MENU: list[tuple[str, str, str]] = [
     ("1", "Настройка — создать config.yaml из шаблона", "init"),
+    ("t", "Инструкция: как получить токены/ключи API", "tokens"),
     ("2", "Обновить базу whitelist", "wl_update"),
     ("3", "Показать статус базы whitelist", "wl_stats"),
     ("4", "Проверить хостеров (токены, баланс)", "ping"),
@@ -82,7 +83,14 @@ def _dispatch(action: str, config: Path) -> None:
                 console.print("[dim]оставлено без изменений[/dim]")
                 return
         cli.do_init(config, force=force)
-        console.print("[dim]теперь отредактируйте config.yaml и .env (см. docs/tokens.md)[/dim]")
+        console.print(
+            "[dim]теперь отредактируйте config.yaml и .env "
+            "(пункт меню «t» — как получить токены)[/dim]"
+        )
+        return
+
+    if action == "tokens":
+        cli.tokens()
         return
 
     # everything else needs a valid config
