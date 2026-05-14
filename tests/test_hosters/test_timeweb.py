@@ -30,7 +30,9 @@ def _fast_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _instant(_: float) -> None:
         return None
 
+    # retry backoff lives in _http; the request-pacing sleep lives in timeweb
     monkeypatch.setattr("wlfinder.hosters._http.asyncio.sleep", _instant)
+    monkeypatch.setattr("wlfinder.hosters.timeweb.asyncio.sleep", _instant)
 
 
 @pytest.fixture

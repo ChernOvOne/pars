@@ -15,6 +15,7 @@ itself if any step fails, so a partial failure never leaks resources.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any, Literal
 
@@ -31,6 +32,10 @@ log = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.timeweb.cloud/api/v1"
 _HOURS_PER_MONTH = 720  # Timeweb presets are priced per month.
+# Timeweb rate-limits bursts with 403, so every API call across all parallel
+# workers is spaced by at least this many seconds (one shared TimewebHoster
+# instance is used by the whole run).
+_MIN_REQUEST_INTERVAL = 0.8
 
 
 class TimewebConfig(BaseModel):
@@ -57,6 +62,9 @@ class TimewebHoster:
         self._client = client
         self._token = resolve_secret(cfg.token_env)
         self._ssh_key_id: int | None = None
+        # Shared request pacing — Timeweb 403s bursty traffic.
+        self._rate_lock = asyncio.Lock()
+        self._last_request = 0.0
 
     @classmethod
     def from_config(cls, raw: dict[str, Any], client: httpx.AsyncClient) -> TimewebHoster:
@@ -69,6 +77,15 @@ class TimewebHoster:
             "Content-Type": "application/json",
         }
 
+    async def _pace(self) -> None:
+        """Space API calls by at least _MIN_REQUEST_INTERVAL, run-wide."""
+        async with self._rate_lock:
+            loop = asyncio.get_event_loop()
+            wait = _MIN_REQUEST_INTERVAL - (loop.time() - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request = loop.time()
+
     async def _request(
         self,
         method: str,
@@ -77,6 +94,7 @@ class TimewebHoster:
         json: dict[str, Any] | None = None,
         ok: tuple[int, ...] = (200, 201, 204),
     ) -> httpx.Response:
+        await self._pace()
         return await request_with_retries(
             self._client,
             method,
