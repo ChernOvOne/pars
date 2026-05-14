@@ -1,0 +1,62 @@
+general:
+  log_level: INFO
+  db_path: ~/.local/share/wlfinder/wlfinder.db
+  cache_dir: ~/.cache/wlfinder
+
+whitelist:
+  sources:
+    - type: github
+      name: hxehex-cidr
+      url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/cidrwhitelist.txt
+    - type: github
+      name: hxehex-ip
+      url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/ipwhitelist.txt
+  refresh_ttl_hours: 24
+
+orchestrator:
+  max_attempts: 30
+  delay_between_attempts_sec: 15
+  parallel_workers: 1            # >1 поднимает несколько серверов параллельно (Phase 4)
+  bail_on_balance_threshold_rub: 50
+
+hosters:
+  - name: timeweb-spb
+    type: timeweb
+    enabled: true
+    token_env: TIMEWEB_TOKEN
+    preset_id: 4795             # минимальный тариф
+    os_id: 99                   # Ubuntu 24.04
+    region: ru-1                # СПб
+    bandwidth: 100
+
+  - name: regru-msk
+    type: regru
+    enabled: false              # Phase 3
+    token_env: REGRU_TOKEN
+    size: cloud-1
+    image: ubuntu-22-04-amd64
+    region_slug: msk1
+    ssh_key_fingerprints: []
+
+  - name: selectel-spb
+    type: selectel
+    enabled: false              # Phase 3 (требует service-user, OpenStack)
+    service_user_env: SELECTEL_SERVICE_USER
+    service_pass_env: SELECTEL_SERVICE_PASS
+    project_id_env: SELECTEL_PROJECT_ID
+    region: ru-2
+    flavor_name: SL1.1-1024-15
+    image_name: Ubuntu 24.04 LTS 64-bit
+
+  - name: cloudru-msk
+    type: cloudru
+    enabled: false              # Phase 3
+    key_id_env: CLOUDRU_KEY_ID
+    key_secret_env: CLOUDRU_KEY_SECRET
+    project_id_env: CLOUDRU_PROJECT_ID
+
+notify:
+  telegram:
+    enabled: true
+    bot_token_env: TELEGRAM_BOT_TOKEN   # имя env-переменной с токеном бота
+    chat_id: "123456789"                # chat_id админа (или группы)
