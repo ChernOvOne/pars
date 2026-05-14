@@ -1,5 +1,6 @@
 """Tests for the IP-roulette orchestrator (hosters + notifier faked)."""
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from ipaddress import ip_network
 
@@ -25,6 +26,7 @@ class FakeHoster:
         self._n = 0
 
     async def create(self, *, name: str, ssh_pub_key: str, user_data: str | None) -> CreatedServer:
+        await asyncio.sleep(0)  # a suspension point so parallel workers interleave
         ip = self._ips[self._n % len(self._ips)]
         self._n += 1
         sid = f"srv-{self._n}"
@@ -191,3 +193,47 @@ async def test_attempts_are_persisted(db: Database, ssh_key: SshKeyPair) -> None
     assert await db.count_attempts() == 2
     rates = await db.hit_rate_by_hoster()
     assert rates == [{"hoster": "h1", "attempts": 2, "hits": 1, "hit_rate": 0.5}]
+
+
+async def test_parallel_workers_single_winner(db: Database, ssh_key: SshKeyPair) -> None:
+    # 3 workers, every IP hits — exactly one server is kept + notified, and
+    # every other server that got created is deleted (no leaks).
+    hoster = FakeHoster("h1", ["192.168.0.7"])
+    notifier = FakeNotifier()
+    orch = Orchestrator(
+        _cfg(max_attempts=9, parallel_workers=3),
+        db,
+        _checker("192.168.0.0/24"),
+        [hoster],
+        notifier,
+        ssh_key,
+    )
+
+    result = await orch.run()
+
+    assert result.hit is True
+    assert result.kept is not None
+    assert len(notifier.sent) == 1  # exactly one winner, even with 3 workers racing
+    kept_id = result.kept.server.server_id
+    # no leaks: every created server other than the kept one was deleted
+    assert set(hoster.created) - {kept_id} == set(hoster.deleted)
+
+
+async def test_parallel_workers_exhausted_raises(db: Database, ssh_key: SshKeyPair) -> None:
+    # 4 workers, nothing ever hits — all attempts spent, NoHitError, no leaks.
+    hoster = FakeHoster("h1", ["8.8.8.8"])
+    orch = Orchestrator(
+        _cfg(max_attempts=8, parallel_workers=4),
+        db,
+        _checker("192.168.0.0/24"),
+        [hoster],
+        FakeNotifier(),
+        ssh_key,
+    )
+
+    with pytest.raises(NoHitError):
+        await orch.run()
+
+    assert len(hoster.created) == 8
+    assert set(hoster.deleted) == set(hoster.created)
+    assert await db.count_attempts() == 8
