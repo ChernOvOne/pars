@@ -77,9 +77,14 @@ async def request_with_retries(
         status = resp.status_code
         log.debug("hoster.request", label=label, method=method, url=url, status=status)
 
-        # 403 from RU hosters is often soft rate-limiting under bursty load
-        # (not a dead token), so retry it with backoff and only treat a
-        # *persistent* 403 as fatal. A 401 is always an immediate auth failure.
+        # A quota/daily-limit 403 (e.g. Timeweb "daily_limit_exceeded") will
+        # never clear by retrying — surface it immediately and clearly.
+        if status == 403 and ("daily_limit" in resp.text or "limit_exceeded" in resp.text):
+            raise HosterError(f"{label}: quota / daily limit reached — {_safe_body(resp)}")
+
+        # An ordinary 403 from RU hosters is often soft rate-limiting under
+        # bursty load (not a dead token), so retry it with backoff and only
+        # treat a *persistent* 403 as fatal. A 401 is always an auth failure.
         if status in (403, 429) or status >= 500:
             if attempt < max_retries:
                 sleep_for = _retry_after(resp, delay)

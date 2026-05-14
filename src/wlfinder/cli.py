@@ -18,7 +18,7 @@ from wlfinder import __version__
 from wlfinder.asn import AsnOverlap, AsnStore, compute_overlap, resolve_asns
 from wlfinder.config import Config
 from wlfinder.db import Database
-from wlfinder.hosters.base import Hoster
+from wlfinder.hosters.base import Hoster, HosterError
 from wlfinder.hosters.registry import build_hoster
 from wlfinder.models import ServerInfo
 from wlfinder.notifier import NullNotifier, TelegramNotifier, build_notifier
@@ -335,6 +335,9 @@ async def _run(cfg: Config, only: list[str], max_attempts: int | None, dry_run: 
             except NoHitError as exc:
                 console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(2) from exc
+            except HosterError as exc:
+                console.print(f"[red]hoster error:[/red] {exc}")
+                raise typer.Exit(1) from exc
 
     if result.kept is not None:
         srv = result.kept.server
