@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import shutil
+from importlib import resources
 from ipaddress import IPv4Network
 from pathlib import Path
 
@@ -101,17 +101,29 @@ def _main(
 
 
 # --------------------------------------------------------------------------- init
+def _example_config_text() -> str:
+    """Read the bundled config.example.yaml (packaged inside wlfinder)."""
+    return (
+        resources.files("wlfinder")
+        .joinpath("config.example.yaml")
+        .read_text(encoding="utf-8")
+    )
+
+
 def do_init(config: Path, *, force: bool) -> None:
-    """Copy config.example.yaml -> config. Shared by the `init` command and menu."""
-    example = _find_example()
-    if example is None:
-        console.print("[red]config.example.yaml not found next to the package[/red]")
-        raise typer.Exit(1)
+    """Write config.example.yaml -> config. Shared by the `init` command and menu."""
     if config.exists() and not force:
         console.print(f"[yellow]{config} already exists[/yellow] (use --force to overwrite)")
         raise typer.Exit(1)
-    shutil.copyfile(example, config)
-    console.print(f"[green]wrote {config}[/green] — edit it, then set tokens in .env")
+    try:
+        text = _example_config_text()
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        console.print("[red]bundled config.example.yaml is missing[/red]")
+        raise typer.Exit(1) from exc
+    config.write_text(text, encoding="utf-8")
+    console.print(
+        f"[green]wrote {config.resolve()}[/green] — edit it, then set tokens in .env"
+    )
 
 
 @app.command()
@@ -119,17 +131,8 @@ def init(
     config: Path = ConfigOption,
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config.yaml."),
 ) -> None:
-    """Copy config.example.yaml -> config.yaml."""
+    """Create config.yaml from the bundled template."""
     do_init(config, force=force)
-
-
-def _find_example() -> Path | None:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "config.example.yaml"
-        if candidate.exists():
-            return candidate
-    return None
 
 
 # ---------------------------------------------------------------------- whitelist
