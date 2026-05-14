@@ -47,7 +47,8 @@ async def request_with_retries(
     url: str,
     *,
     headers: dict[str, str],
-    json: dict[str, Any] | None = None,
+    json: Any = None,
+    params: dict[str, Any] | None = None,
     ok: tuple[int, ...] = (200, 201, 204),
     max_retries: int = DEFAULT_MAX_RETRIES,
     label: str = "hoster",
@@ -64,7 +65,7 @@ async def request_with_retries(
     delay = 1.0
     for attempt in range(max_retries + 1):
         try:
-            resp = await client.request(method, url, json=json, headers=headers)
+            resp = await client.request(method, url, json=json, params=params, headers=headers)
         except httpx.TransportError as exc:
             if attempt >= max_retries:
                 raise HosterError(f"{label}: transport error on {url}: {exc}") from exc

@@ -62,13 +62,16 @@ hosters:
 
   - name: cloudru-msk
     type: cloudru
-    enabled: false              # OAuth2 client_credentials
+    enabled: false              # ключ сервисного аккаунта (console.cloud.ru)
     key_id_env: CLOUDRU_KEY_ID
     key_secret_env: CLOUDRU_KEY_SECRET
     project_id_env: CLOUDRU_PROJECT_ID
-    flavor: ""                  # id/слаг тарифа
-    image: ""                   # id/слаг образа ОС
-    region: ru-central-1
+    flavor: lowcost10-1-1       # flavor_name  — список: GET /api/v1/flavors
+    image: ubuntu-22.04         # image_name   — список: GET /api/v1/images
+    zone: ru.AZ-1               # availability_zone_name
+    subnet: default             # subnet_name  — список: GET /api/v1/subnets
+    disk_type: SSD
+    disk_size: 10
 
   - name: clo-msk
     type: clo

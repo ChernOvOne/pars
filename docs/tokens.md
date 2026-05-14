@@ -78,21 +78,35 @@ SELECTEL_PROJECT_ID=     # ID облачного проекта
 
 ---
 
-## 4. Cloud.ru Evolution — Key ID + Key Secret (OAuth2)
+## 4. Cloud.ru Evolution — ключ сервисного аккаунта
 
 ```
-CLOUDRU_KEY_ID=          # идентификатор ключа
-CLOUDRU_KEY_SECRET=      # секрет ключа
-CLOUDRU_PROJECT_ID=      # ID проекта
+CLOUDRU_KEY_ID=          # Key ID ключа доступа
+CLOUDRU_KEY_SECRET=      # Key Secret (показывается один раз)
+CLOUDRU_PROJECT_ID=      # ID проекта из console.cloud.ru
 ```
 
-1. Личный кабинет Cloud.ru → раздел управления доступом / **ключи API**.
-2. Создайте пару **Key ID + Key Secret** (секрет показывается один раз).
-3. `PROJECT_ID` возьмите в свойствах вашего проекта.
-4. В `config.yaml` укажите `flavor` и `image` (id/слаг тарифа и образа).
-5. Проверка: `pars hoster ping`.
+1. Войдите в **console.cloud.ru** → управление доступом → создайте
+   **персональный ключ доступа сервисного аккаунта**
+   (инструкция: <https://cloud.ru/docs/console_api/ug/topics/guides__api_key>).
+   Скопируйте `Key ID` и `Key Secret` — секрет показывается один раз.
+2. `PROJECT_ID` — идентификатор проекта, виден в console.cloud.ru.
+3. В `config.yaml` укажите **имена** ресурсов (не UUID):
+   - `flavor` — тариф, например `lowcost10-1-1`;
+   - `image` — образ ОС, например `ubuntu-22.04`;
+   - `zone` — зона доступности, например `ru.AZ-1`;
+   - `subnet` — подсеть, например `default`.
 
-Документация: <https://cloud.ru/docs/foundation/ug/topics/api-list.html>
+   Где взять доступные значения:
+   - в **консоли** — прямо в форме создания ВМ (вкладки тарифов и образов);
+   - через **API**: `GET /api/v1/flavors`, `GET /api/v1/images?project_id=...`,
+     `GET /api/v1/availability-zones`, `GET /api/v1/subnets?project_id=...`.
+4. Проверка: `pars hoster ping`.
+
+API — REST, база `https://compute.api.cloud.ru` (авторизация — Bearer-токен
+из `https://iam.api.cloud.ru/api/v1/auth/token`). Публичный IP виртуальной
+машины — это floating IP, который wlfinder выделяет автоматически при
+создании. Документация: <https://cloud.ru/docs/virtual-machines/ug/index>
 
 ---
 
