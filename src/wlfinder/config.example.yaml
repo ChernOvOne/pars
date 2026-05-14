@@ -30,14 +30,12 @@ orchestrator:
   bail_on_balance_threshold_rub: 50
 
 hosters:
-  - name: timeweb-spb
+  - name: timeweb-msk
     type: timeweb
     enabled: true
     token_env: TIMEWEB_TOKEN
-    preset_id: 4795             # минимальный тариф
-    os_id: 99                   # Ubuntu 24.04
-    region: ru-1                # СПб
-    bandwidth: 100
+    # wlfinder крутит рулетку на floating IP (без VPS) — нужна только зона.
+    availability_zone: msk-1    # Москва (ещё: spb-1, spb-2, nsk-1)
 
   - name: regru-msk
     type: regru
