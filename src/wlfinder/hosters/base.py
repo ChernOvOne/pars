@@ -52,6 +52,16 @@ class Hoster(Protocol):
         user_data: str | None,
     ) -> CreatedServer: ...
 
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        """Called only on a whitelist hit — turn the kept resource into a
+        usable server.
+
+        Floating-IP hosters create a VM and bind the winning IP to it;
+        hosters that already create a real server in ``create()`` just
+        return *server* unchanged. Must clean up after itself on failure.
+        """
+        ...
+
     async def delete(self, server_id: str) -> None: ...
 
     async def list_servers(self) -> list[ServerInfo]:

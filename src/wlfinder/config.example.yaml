@@ -34,8 +34,13 @@ hosters:
     type: timeweb
     enabled: true
     token_env: TIMEWEB_TOKEN
-    # wlfinder крутит рулетку на floating IP (без VPS) — нужна только зона.
+    # Рулетка крутится на floating IP (без VPS). preset_id/os_id/bandwidth
+    # нужны ТОЛЬКО для сервера, который создаётся при ПОПАДАНИИ (promote);
+    # без preset_id хит просто оставляет зарезервированный белый IP.
     availability_zone: msk-1    # Москва (ещё: spb-1, spb-2, nsk-1)
+    preset_id: 4799            # московский тариф для сервера на хите
+    os_id: 99                  # Ubuntu 24.04
+    bandwidth: 1000            # минимум для preset 4799
 
   - name: regru-msk
     type: regru

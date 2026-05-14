@@ -176,6 +176,13 @@ class CloudRuHoster:
             await asyncio.sleep(_POLL_INTERVAL)
         return ip, raw  # timed out — return whatever we have
 
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        # Cloud.ru VM provisioning proved unreliable in testing (it could hang
+        # in "creating" for hours), so a hit just keeps the whitelisted
+        # floating IP reserved — attach a VM to it manually for now.
+        log.info("cloudru.promote_skipped", floating_ip=server.public_ipv4)
+        return server
+
     async def delete(self, server_id: str) -> None:
         """Release a floating IP. ``server_id`` is the floating-IP id.
 

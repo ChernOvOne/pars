@@ -156,6 +156,9 @@ class RegruHoster:
                 return ipv4, _normalise_ipv6(reglet.get("ipv6")), reglet
         return None, None, reglet
 
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        return server  # create() already provisioned a real reglet
+
     async def delete(self, server_id: str) -> None:
         """Delete a reglet. Idempotent: a 404 (already gone) counts as success."""
         resp = await self._request("DELETE", f"/reglets/{server_id}", ok=(200, 202, 204, 404))

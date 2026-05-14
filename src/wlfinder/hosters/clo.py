@@ -133,6 +133,9 @@ class CloHoster:
                 return ipv4, instance
         return None, instance
 
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        return server  # create() already provisioned a real instance
+
     async def delete(self, server_id: str) -> None:
         resp = await self._request("DELETE", f"/instances/{server_id}", ok=(200, 202, 204, 404))
         log.info("clo.deleted", server_id=server_id, status=resp.status_code)

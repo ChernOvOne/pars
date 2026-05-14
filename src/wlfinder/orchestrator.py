@@ -221,6 +221,14 @@ class Orchestrator:
     async def _handle_hit(
         self, hoster: Hoster, server: CreatedServer, attempt_no: int
     ) -> RunResult:
+        # Turn the kept resource into a usable server. Best-effort: the
+        # whitelisted IP is the prize, so a failed promotion still notifies.
+        try:
+            server = await hoster.promote(server, self._ssh_key.public)
+        except Exception as exc:  # noqa: BLE001 - promotion must not lose the hit
+            log.warning(
+                "orchestrator.promote_failed", ipv4=server.public_ipv4, error=str(exc)
+            )
         kept = keep_server(server, self._ssh_key)
         cost = await _safe_cost(hoster)
         notified = await self._notifier.notify_hit(

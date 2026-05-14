@@ -50,6 +50,12 @@ class TimewebConfig(BaseModel):
     # Where to allocate floating IPs. Known zones: msk-1 (Moscow),
     # spb-1 / spb-2 (St. Petersburg), nsk-1 (Novosibirsk).
     availability_zone: str = "msk-1"
+    # Used only by promote() — building a server on a HIT. The roulette
+    # itself never creates a server, so these are optional; without
+    # preset_id a hit just keeps the bare floating IP.
+    preset_id: int | None = None
+    os_id: int = 99  # Ubuntu 24.04
+    bandwidth: int = 1000  # must be >= the preset's minimum
 
 
 class TimewebHoster:
@@ -60,6 +66,7 @@ class TimewebHoster:
         self._cfg = cfg
         self._client = client
         self._token = resolve_secret(cfg.token_env)
+        self._ssh_key_id: int | None = None
         # Shared request pacing — Timeweb 403s bursty traffic.
         self._rate_lock = asyncio.Lock()
         self._last_request = 0.0
@@ -135,6 +142,81 @@ class TimewebHoster:
             region=str(fip.get("availability_zone") or self._cfg.availability_zone),
             raw=fip,
         )
+
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        """On a hit: create a VM and bind the winning floating IP to it.
+
+        Without ``preset_id`` configured the floating IP is simply kept as-is
+        (still a valid result — the whitelisted IP is reserved).
+        """
+        if self._cfg.preset_id is None:
+            log.warning(
+                "timeweb.promote_skipped",
+                reason="no preset_id configured",
+                floating_ip=server.public_ipv4,
+            )
+            return server
+
+        fip_id = server.server_id
+        vm_name = str(server.raw.get("comment") or f"wlfinder-{fip_id[:8]}")
+        ssh_key_id = await self._ensure_ssh_key(ssh_pub_key)
+        body: dict[str, Any] = {
+            "name": vm_name,
+            "preset_id": self._cfg.preset_id,
+            "os_id": self._cfg.os_id,
+            "bandwidth": self._cfg.bandwidth,
+            "is_ddos_guard": False,
+            "is_local_network": False,
+            "ssh_keys_ids": [ssh_key_id],
+        }
+        resp = await self._request("POST", "/servers", json=body, ok=(200, 201))
+        vm = resp.json()["server"]
+        vm_id = str(vm["id"])
+        try:
+            await self._bind_floating_ip(fip_id, vm_id)
+        except BaseException:
+            await self._safe_cleanup(vm_id)  # don't leak the VM we just made
+            raise
+        log.info("timeweb.promoted", server_id=vm_id, floating_ip=server.public_ipv4)
+        return CreatedServer(
+            hoster=self.name,
+            server_id=vm_id,
+            public_ipv4=server.public_ipv4,
+            region=server.region,
+            raw={"server": vm, "floating_ip": server.raw},
+        )
+
+    async def _ensure_ssh_key(self, ssh_pub_key: str) -> int:
+        """Upload our SSH key once, reusing it if Timeweb already has it."""
+        if self._ssh_key_id is not None:
+            return self._ssh_key_id
+        listed = await self._request("GET", "/ssh-keys")
+        for key in listed.json().get("ssh_keys", []):
+            if str(key.get("body", "")).strip() == ssh_pub_key.strip():
+                self._ssh_key_id = int(key["id"])
+                return self._ssh_key_id
+        created = await self._request(
+            "POST",
+            "/ssh-keys",
+            json={"name": "wlfinder", "body": ssh_pub_key, "is_default": False},
+        )
+        self._ssh_key_id = int(created.json()["ssh_key"]["id"])
+        return self._ssh_key_id
+
+    async def _bind_floating_ip(self, fip_id: str, server_id: str) -> None:
+        await self._request(
+            "POST",
+            f"/floating-ips/{fip_id}/bind",
+            json={"resource_id": server_id, "resource_type": "server"},
+            ok=(200, 201, 204),
+        )
+
+    async def _safe_cleanup(self, server_id: str) -> None:
+        try:
+            await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
+            log.info("timeweb.cleanup_deleted", server_id=server_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            log.error("timeweb.cleanup_failed", server_id=server_id, error=str(exc))
 
     async def delete(self, server_id: str) -> None:
         """Release a floating IP. ``server_id`` is the floating-IP id; 404 == gone."""

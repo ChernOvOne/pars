@@ -13,6 +13,7 @@ import respx
 
 from wlfinder.hosters.base import HosterAuthError, HosterError, RateLimitError
 from wlfinder.hosters.timeweb import TimewebConfig, TimewebHoster
+from wlfinder.models import CreatedServer
 
 API = "https://api.timeweb.cloud/api/v1"
 
@@ -124,6 +125,58 @@ async def test_rate_limit_exhausted_raises(hoster: TimewebHoster) -> None:
 async def test_health_check_ok(hoster: TimewebHoster) -> None:
     respx.get(f"{API}/account/status").mock(return_value=httpx.Response(200, json={"status": {}}))
     assert await hoster.health_check() is True
+
+
+@respx.mock
+async def test_promote_creates_server_and_binds_ip() -> None:
+    cfg = TimewebConfig.model_validate(
+        {
+            "name": "timeweb-msk",
+            "type": "timeweb",
+            "token_env": "TIMEWEB_TOKEN",
+            "availability_zone": "msk-1",
+            "preset_id": 4799,
+        }
+    )
+    async with httpx.AsyncClient() as client:
+        h = TimewebHoster(cfg, client)
+        respx.get(f"{API}/ssh-keys").mock(return_value=httpx.Response(200, json={"ssh_keys": []}))
+        respx.post(f"{API}/ssh-keys").mock(
+            return_value=httpx.Response(201, json={"ssh_key": {"id": 55}})
+        )
+        create_vm = respx.post(f"{API}/servers").mock(
+            return_value=httpx.Response(201, json={"server": {"id": 7777}})
+        )
+        bind = respx.post(f"{API}/floating-ips/fip-1/bind").mock(
+            return_value=httpx.Response(204)
+        )
+        fip = CreatedServer(
+            hoster="timeweb-msk",
+            server_id="fip-1",
+            public_ipv4="203.0.113.50",
+            region="msk-1",
+            raw={"id": "fip-1", "ip": "203.0.113.50", "comment": "wlfinder-x"},
+        )
+        promoted = await h.promote(fip, "ssh-ed25519 AAA test")
+
+    assert promoted.server_id == "7777"  # now the VM id
+    assert promoted.public_ipv4 == "203.0.113.50"  # the floating IP, unchanged
+    sent = json.loads(create_vm.calls.last.request.content)
+    assert sent["preset_id"] == 4799
+    assert sent["name"] == "wlfinder-x"  # taken from the floating IP's comment
+    assert json.loads(bind.calls.last.request.content) == {
+        "resource_id": "7777",
+        "resource_type": "server",
+    }
+
+
+async def test_promote_without_preset_keeps_floating_ip(hoster: TimewebHoster) -> None:
+    # tw_cfg has no preset_id -> promote is a no-op (the IP stays reserved)
+    fip = CreatedServer(
+        hoster="timeweb-msk", server_id="fip-1", public_ipv4="1.2.3.4", region="msk-1", raw={}
+    )
+    promoted = await hoster.promote(fip, "ssh-ed25519 AAA test")
+    assert promoted is fip  # unchanged, no API calls made
 
 
 @respx.mock

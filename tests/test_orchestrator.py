@@ -35,6 +35,9 @@ class FakeHoster:
             hoster=self.name, server_id=sid, public_ipv4=ip, region="ru-1", raw={}
         )
 
+    async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
+        return server
+
     async def delete(self, server_id: str) -> None:
         self.deleted.append(server_id)
 
