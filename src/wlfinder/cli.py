@@ -114,17 +114,22 @@ def _bundled(name: str) -> str:
 def do_init(config: Path, *, force: bool) -> None:
     """Create config.yaml plus a .env template next to it.
 
-    Shared by the `init` command and the interactive menu.
+    Each file is handled independently — an existing config.yaml does not
+    stop the .env template from being written. Shared by the `init` command
+    and the interactive menu.
     """
     if config.exists() and not force:
-        console.print(f"[yellow]{config} already exists[/yellow] (use --force to overwrite)")
-        raise typer.Exit(1)
-    try:
-        config.write_text(_bundled("config.example.yaml"), encoding="utf-8")
-    except (FileNotFoundError, ModuleNotFoundError) as exc:
-        console.print("[red]bundled config.example.yaml is missing[/red]")
-        raise typer.Exit(1) from exc
-    console.print(f"[green]wrote {config.resolve()}[/green]")
+        console.print(
+            f"[yellow]{config} already exists[/yellow] — left as-is "
+            "(use --force to overwrite)"
+        )
+    else:
+        try:
+            config.write_text(_bundled("config.example.yaml"), encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError) as exc:
+            console.print("[red]bundled config.example.yaml is missing[/red]")
+            raise typer.Exit(1) from exc
+        console.print(f"[green]wrote {config.resolve()}[/green]")
 
     env_path = config.with_name(".env")
     if env_path.exists():
