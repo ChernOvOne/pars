@@ -91,7 +91,9 @@ class TimewebHoster:
                 self._ssh_key_id = int(key["id"])
                 return self._ssh_key_id
         created = await self._request(
-            "POST", "/ssh-keys", json={"name": "wlfinder", "body": ssh_pub_key}
+            "POST",
+            "/ssh-keys",
+            json={"name": "wlfinder", "body": ssh_pub_key, "is_default": False},
         )
         self._ssh_key_id = int(created.json()["ssh_key"]["id"])
         return self._ssh_key_id
