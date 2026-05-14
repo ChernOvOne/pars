@@ -50,20 +50,44 @@ hosters:
 
   - name: selectel-spb
     type: selectel
-    enabled: false              # Phase 3 (требует service-user, OpenStack)
+    enabled: false              # требует service-user (OpenStack Keystone)
+    account_id_env: SELECTEL_ACCOUNT_ID
     service_user_env: SELECTEL_SERVICE_USER
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-2
-    flavor_name: SL1.1-1024-15
-    image_name: Ubuntu 24.04 LTS 64-bit
+    flavor_id: ""               # UUID flavor'а из панели/Nova API
+    image_id: ""                # UUID образа ОС
+    network_id: ""              # UUID публичной сети
 
   - name: cloudru-msk
     type: cloudru
-    enabled: false              # Phase 3
+    enabled: false              # OAuth2 client_credentials
     key_id_env: CLOUDRU_KEY_ID
     key_secret_env: CLOUDRU_KEY_SECRET
     project_id_env: CLOUDRU_PROJECT_ID
+    flavor: ""                  # id/слаг тарифа
+    image: ""                   # id/слаг образа ОС
+    region: ru-central-1
+
+  - name: clo-msk
+    type: clo
+    enabled: false
+    token_env: CLO_TOKEN
+    flavor: ""                  # id/слаг тарифа
+    image: ""                   # id/слаг образа ОС
+    region: msk
+
+  - name: onecloud-msk
+    type: 1cloud
+    enabled: false
+    token_env: ONECLOUD_TOKEN
+    cpu: 1
+    ram: 1024                   # МБ
+    hdd: 20                     # ГБ
+    hdd_type: SSD
+    image_id: 0                 # ID образа ОС из 1cloud
+    dc_location: SdnLandsbergiPlatz
 
 notify:
   telegram:

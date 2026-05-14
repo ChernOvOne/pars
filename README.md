@@ -5,9 +5,14 @@
 **уведомляет администратора в Telegram** — у какого хостера и какой IP оказался
 в белом списке. Сервер при этом остаётся запущенным.
 
-> **Статус:** Фаза 1 (MVP). Реализован один хостер — **Timeweb Cloud**.
-> Остальные хостеры, `asn-stats` и `destroy` — следующие фазы
-> (см. `docs/spec.md`, раздел 17).
+> **Статус:** реализованы все 6 хостеров — **Timeweb Cloud**, **REG.ru
+> CloudVPS**, **Selectel**, **Cloud.ru**, **CLO.ru**, **1cloud** — а также
+> `asn-stats`, `destroy --all` и интерактивное меню `pars`.
+>
+> ⚠️ Полноценно проверены на боевом API только Timeweb и REG.ru. Для
+> Selectel / Cloud.ru / CLO.ru / 1cloud интеграции написаны по
+> документации (ТЗ даёт по ним мало деталей) — перед продакшеном сверьте
+> запросы с реальным API; в `config.example.yaml` они идут `enabled: false`.
 
 ---
 
@@ -92,6 +97,10 @@ pars run --dry-run
 |-----|-----------|
 | Timeweb Cloud | Панель → API и терминал → [Токены API](https://timeweb.cloud/my/api-keys) |
 | REG.ru CloudVPS | ЛК → Облачные серверы → Настройки → Токен для API |
+| Selectel | Панель → Управление доступом → сервисный пользователь (OpenStack) |
+| Cloud.ru | Личный кабинет → ключи доступа: Key ID + Key Secret (OAuth2) |
+| CLO.ru | Личный кабинет → раздел API → токен |
+| 1cloud | Панель → раздел API → ключ |
 | Telegram-бот | [@BotFather](https://t.me/BotFather) → `/newbot` → токен; `chat_id` — через `getUpdates` или [@userinfobot](https://t.me/userinfobot) |
 
 Токены кладутся **только** в `.env`; в `config.yaml` хранится лишь имя
