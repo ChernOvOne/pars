@@ -77,7 +77,10 @@ async def request_with_retries(
         status = resp.status_code
         log.debug("hoster.request", label=label, method=method, url=url, status=status)
 
-        if status == 429 or status >= 500:
+        # 403 from RU hosters is often soft rate-limiting under bursty load
+        # (not a dead token), so retry it with backoff and only treat a
+        # *persistent* 403 as fatal. A 401 is always an immediate auth failure.
+        if status in (403, 429) or status >= 500:
             if attempt < max_retries:
                 sleep_for = _retry_after(resp, delay)
                 log.warning("hoster.retry", label=label, status=status, sleep=sleep_for)
@@ -86,10 +89,14 @@ async def request_with_retries(
                 continue
             if status == 429:
                 raise RateLimitError(f"{label}: rate limited on {url}")
+            if status == 403:
+                raise HosterAuthError(
+                    f"{label}: forbidden (403) — token rejected or rate limited"
+                )
             raise HosterError(f"{label}: server error {status} on {url}")
 
-        if status in (401, 403):
-            raise HosterAuthError(f"{label}: token rejected ({status})")
+        if status == 401:
+            raise HosterAuthError(f"{label}: token rejected (401)")
         if status == 402:
             raise BalanceError(f"{label}: insufficient balance (HTTP 402)")
         if status not in ok:
