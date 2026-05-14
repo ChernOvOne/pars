@@ -1,11 +1,20 @@
 """Timeweb Cloud hoster integration.
 
-API docs: https://timeweb.cloud/api-docs  (base: /api/v1, Bearer auth).
+Reverse-engineered against the live API (api.timeweb.cloud/api/v1) — a
+fresh Timeweb server has a public network interface but **no IP**; the
+public IPv4 is a separately-allocated "floating IP":
+
+  POST /servers                  -> create the server (no public IP yet)
+  POST /floating-ips             -> allocate a floating IPv4 in the server's AZ
+  POST /floating-ips/{id}/bind   -> attach that floating IP to the server
+  DELETE /floating-ips/{id}  /  DELETE /servers/{id}
+
+``create()`` runs all three steps and deletes the server (and floating IP)
+itself if any step fails, so a partial failure never leaks resources.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from typing import Any, Literal
 
@@ -21,8 +30,6 @@ from wlfinder.models import ServerInfo
 log = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.timeweb.cloud/api/v1"
-_IP_POLL_INTERVAL = 2.0
-_IP_POLL_TIMEOUT = 60.0
 _HOURS_PER_MONTH = 720  # Timeweb presets are priced per month.
 
 
@@ -37,7 +44,7 @@ class TimewebConfig(BaseModel):
     token_env: str = "TIMEWEB_TOKEN"
     preset_id: int
     os_id: int
-    region: str = "ru-1"
+    region: str = "ru-1"  # cosmetic label; the real AZ comes from the API
     bandwidth: int = 100
 
 
@@ -122,44 +129,83 @@ class TimewebHoster:
         resp = await self._request("POST", "/servers", json=body, ok=(200, 201))
         server = resp.json()["server"]
         server_id = str(server["id"])
+        az = server.get("availability_zone")
 
-        ipv4 = _extract_ip(server, "ipv4")
-        ipv6 = _extract_ip(server, "ipv6")
-        if ipv4 is None:
-            ipv4, ipv6, server = await self._poll_for_ip(server_id)
-        if ipv4 is None:
-            raise HosterError(
-                f"timeweb: server {server_id} got no public IPv4 within "
-                f"{_IP_POLL_TIMEOUT:.0f}s"
+        # From here on we own a server — delete it if anything below fails.
+        fip_id: str | None = None
+        try:
+            fip = await self._create_floating_ip(az)
+            fip_id = str(fip["id"])
+            await self._bind_floating_ip(fip_id, server_id)
+            public_ipv4 = fip.get("ip")
+            if not public_ipv4:
+                raise HosterError(
+                    f"timeweb: floating IP for server {server_id} has no address"
+                )
+            return CreatedServer(
+                hoster=self.name,
+                server_id=server_id,
+                public_ipv4=str(public_ipv4),
+                region=str(az) if az else self._cfg.region,
+                raw={"server": server, "floating_ip": fip},
             )
+        except BaseException:
+            await self._safe_cleanup(server_id, fip_id)
+            raise
 
-        return CreatedServer(
-            hoster=self.name,
-            server_id=server_id,
-            public_ipv4=ipv4,
-            public_ipv6=ipv6,
-            region=self._cfg.region,
-            raw=server,
+    async def _create_floating_ip(self, availability_zone: str | None) -> dict[str, Any]:
+        if not availability_zone:
+            raise HosterError(
+                "timeweb: server response had no availability_zone — "
+                "cannot allocate a floating IP"
+            )
+        resp = await self._request(
+            "POST",
+            "/floating-ips",
+            json={"availability_zone": availability_zone, "is_ddos_guard": False},
+            ok=(200, 201),
+        )
+        result: dict[str, Any] = resp.json()["ip"]
+        return result
+
+    async def _bind_floating_ip(self, fip_id: str, server_id: str) -> None:
+        await self._request(
+            "POST",
+            f"/floating-ips/{fip_id}/bind",
+            json={"resource_id": server_id, "resource_type": "server"},
+            ok=(200, 201, 204),
         )
 
-    async def _poll_for_ip(
-        self, server_id: str
-    ) -> tuple[str | None, str | None, dict[str, Any]]:
-        """Poll GET /servers/{id} until a public IPv4 shows up (spec §7.1)."""
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + _IP_POLL_TIMEOUT
-        server: dict[str, Any] = {}
-        while loop.time() < deadline:
-            await asyncio.sleep(_IP_POLL_INTERVAL)
-            resp = await self._request("GET", f"/servers/{server_id}")
-            server = resp.json()["server"]
-            ipv4 = _extract_ip(server, "ipv4")
-            if ipv4 is not None:
-                return ipv4, _extract_ip(server, "ipv6"), server
-        return None, None, server
+    async def _safe_cleanup(self, server_id: str, fip_id: str | None) -> None:
+        """Best-effort teardown of a half-created server — never raises."""
+        if fip_id is not None:
+            try:
+                await self._request(
+                    "DELETE", f"/floating-ips/{fip_id}", ok=(200, 202, 204, 404)
+                )
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+                log.error("timeweb.cleanup_fip_failed", fip_id=fip_id, error=str(exc))
+        try:
+            await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
+            log.info("timeweb.cleanup_deleted", server_id=server_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            log.error("timeweb.cleanup_failed", server_id=server_id, error=str(exc))
 
     async def delete(self, server_id: str) -> None:
-        """Delete a server. Idempotent: a 404 (already gone) counts as success."""
+        """Delete a server, releasing its floating IP first. A 404 == already gone."""
+        try:
+            resp = await self._request("GET", f"/servers/{server_id}", ok=(200, 404))
+            if resp.status_code == 200:
+                server = resp.json()["server"]
+                for net in server.get("networks", []):
+                    for ip in net.get("ips", []):
+                        fip_id = ip.get("id")
+                        if fip_id:
+                            await self._request(
+                                "DELETE", f"/floating-ips/{fip_id}", ok=(200, 202, 204, 404)
+                            )
+        except HosterError as exc:  # still try to delete the server itself
+            log.warning("timeweb.fip_cleanup_failed", server_id=server_id, error=str(exc))
         resp = await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
         log.info("timeweb.deleted", server_id=server_id, status=resp.status_code)
 
@@ -171,14 +217,14 @@ class TimewebHoster:
                 server_id=str(server["id"]),
                 name=str(server.get("name", "")),
                 public_ipv4=_extract_ip(server, "ipv4"),
-                region=self._cfg.region,
+                region=str(server.get("availability_zone") or self._cfg.region),
             )
             for server in resp.json().get("servers", [])
         ]
 
     async def health_check(self) -> bool:
-        resp = await self._request("GET", "/account/status")
-        log.info("timeweb.health", hoster=self.name, balance=_extract_balance(resp.json()))
+        await self._request("GET", "/account/status")
+        log.info("timeweb.health", hoster=self.name)
         return True
 
     async def get_balance(self) -> float | None:
