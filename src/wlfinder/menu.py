@@ -35,8 +35,30 @@ _MENU: list[tuple[str, str, str]] = [
 ]
 
 
+def _resolve_menu_config(config: Path) -> Path:
+    """Locate config.yaml for the menu: cwd -> ~/wlfinder -> ask the user."""
+    if config.exists():
+        return config
+    fallback = Path.home() / "wlfinder" / "config.yaml"
+    if fallback.exists():
+        console.print(
+            f"[dim]config.yaml нет в {Path.cwd()} — использую {fallback}[/dim]"
+        )
+        return fallback
+    console.print(f"[yellow]config.yaml не найден[/yellow]  (текущая папка: {Path.cwd()})")
+    answer = Prompt.ask(
+        "Путь к config.yaml (Enter — создать новый в текущей папке)",
+        default=str(config),
+    )
+    chosen = Path(answer).expanduser()
+    if not chosen.exists():
+        cli.do_init(chosen, force=False)
+    return chosen
+
+
 def run_menu(config: Path) -> None:
     """Show the interactive menu loop until the user picks Exit."""
+    config = _resolve_menu_config(config)
     console.print(
         Panel.fit(
             f"[bold]wlfinder[/bold]  ·  v{__version__}\n"

@@ -38,6 +38,15 @@ _COMPUTE_URL = "https://compute.api.cloud.ru"
 _POLL_INTERVAL = 4.0
 _POLL_TIMEOUT = 300.0
 
+# Cloud.ru rejects deletes while a resource is mid-transition (HTTP 422
+# "*_can_not_be_deleted_from_current_state"). delete() waits for the VM to
+# settle into a stable state, then retries the deletes through the 422.
+# Anything not in this set (transitional states, a momentary null state) is
+# treated as "keep waiting".
+_STABLE_STATES = frozenset({"running", "stopped", "active"})
+_DELETE_RETRIES = 12
+_DELETE_RETRY_DELAY = 8.0
+
 
 class CloudRuConfig(BaseModel):
     """The slice of ``config.yaml`` that a Cloud.ru hoster needs.
@@ -151,7 +160,16 @@ class CloudRuHoster:
                     "disk_type_name": self._cfg.disk_type,
                 }
             ],
-            "interfaces": [{"subnet_name": self._cfg.subnet}],
+            # type is required (regular = normal NIC); new_external_ip asks
+            # Cloud.ru to allocate a public IP for the VM right away.
+            "interfaces": [
+                {
+                    "subnet_name": self._cfg.subnet,
+                    "type": "regular",
+                    "new_external_ip": True,
+                }
+            ],
+            # Required for most images — carries the login + SSH key.
             "image_metadata": {
                 "name": "wlfinder",
                 "hostname": name,
@@ -167,28 +185,22 @@ class CloudRuHoster:
         vm = body[0] if isinstance(body, list) else body
         vm_id = str(vm["id"])
 
-        interface_id, raw_vm = await self._wait_for_interface(vm_id)
-        if interface_id is None:
+        public_ipv4, raw_vm = await self._wait_for_public_ip(vm_id)
+        if public_ipv4 is None:
             raise HosterError(
-                f"cloudru: VM {vm_id} got no network interface within {_POLL_TIMEOUT:.0f}s"
+                f"cloudru: VM {vm_id} got no public IPv4 within {_POLL_TIMEOUT:.0f}s"
             )
-
-        zone_id = await self._resolve_zone_id(self._cfg.zone)
-        fip = await self._create_floating_ip(name, zone_id, interface_id)
-        public_ipv4 = fip.get("ip_address")
-        if not public_ipv4:
-            raise HosterError(f"cloudru: floating IP for VM {vm_id} has no address")
 
         return CreatedServer(
             hoster=self.name,
             server_id=vm_id,
-            public_ipv4=str(public_ipv4),
+            public_ipv4=public_ipv4,
             region=self._cfg.zone,
-            raw={"vm": raw_vm, "floating_ip": fip},
+            raw=raw_vm,
         )
 
-    async def _wait_for_interface(self, vm_id: str) -> tuple[str | None, dict[str, Any]]:
-        """Poll the VM until it has a network interface with an id."""
+    async def _wait_for_public_ip(self, vm_id: str) -> tuple[str | None, dict[str, Any]]:
+        """Poll the VM until its interface carries a floating (public) IPv4."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + _POLL_TIMEOUT
         vm: dict[str, Any] = {}
@@ -199,53 +211,64 @@ class CloudRuHoster:
             state = str(vm.get("state", ""))
             if state.startswith("error"):
                 raise HosterError(f"cloudru: VM {vm_id} entered state {state!r}")
-            for iface in vm.get("interfaces", []):
-                if iface.get("id"):
-                    return str(iface["id"]), vm
+            ip = _public_ip(vm)
+            if ip is not None:
+                return ip, vm
         return None, vm
 
-    async def _resolve_zone_id(self, zone_name: str) -> str:
-        resp = await self._request("GET", "/api/v1/availability-zones")
-        data = resp.json()
-        zones = data if isinstance(data, list) else data.get("items", [])
-        for zone in zones:
-            if zone.get("name") == zone_name:
-                return str(zone["id"])
-        raise HosterError(f"cloudru: availability zone {zone_name!r} not found")
-
-    async def _create_floating_ip(
-        self, name: str, zone_id: str, interface_id: str
-    ) -> dict[str, Any]:
-        payload = {
-            "name": f"wlfinder-fip-{name}"[:60],
-            "project_id": self._project,
-            "availability_zone_id": zone_id,
-            "interface_id": interface_id,
-        }
-        resp = await self._request(
-            "POST", "/api/v1/floating-ips", json=payload, ok=(200, 201, 202)
-        )
-        result: dict[str, Any] = resp.json()
-        return result
-
     async def delete(self, server_id: str) -> None:
-        """Delete a VM. Floating IPs are released first (Cloud.ru requires it)."""
-        try:
-            resp = await self._request("GET", f"/api/v1/vms/{server_id}", ok=(200, 404))
-            if resp.status_code == 200:
-                for iface in resp.json().get("interfaces", []):
-                    fip = iface.get("floating_ip")
-                    if isinstance(fip, dict) and fip.get("id"):
-                        await self._request(
-                            "DELETE",
-                            f"/api/v1/floating-ips/{fip['id']}",
-                            ok=(200, 202, 204, 404),
-                        )
-        except HosterError as exc:  # cleanup is best-effort — still try the VM
-            log.warning("cloudru.fip_cleanup_failed", server_id=server_id, error=str(exc))
+        """Delete a VM, releasing its floating IP first.
 
-        resp = await self._request("DELETE", f"/api/v1/vms/{server_id}", ok=(200, 202, 204, 404))
-        log.info("cloudru.deleted", server_id=server_id, status=resp.status_code)
+        Cloud.ru rejects deletes while a resource is still transitioning
+        (e.g. ``creating``), so this waits for the VM to settle and retries
+        the deletes through the resulting 422s.
+        """
+        vm = await self._wait_deletable(server_id)
+        if vm is None:
+            log.info("cloudru.deleted", server_id=server_id, status="already-gone")
+            return
+        for iface in vm.get("interfaces", []):
+            fip = iface.get("floating_ip")
+            if isinstance(fip, dict) and fip.get("id"):
+                await self._delete_retrying_state(f"/api/v1/floating-ips/{fip['id']}")
+        await self._delete_retrying_state(f"/api/v1/vms/{server_id}")
+        log.info("cloudru.deleted", server_id=server_id)
+
+    async def _wait_deletable(self, server_id: str) -> dict[str, Any] | None:
+        """Poll the VM until it leaves a transitional state.
+
+        Returns the VM body, or None if it is already gone / being deleted.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _POLL_TIMEOUT
+        vm: dict[str, Any] = {}
+        while loop.time() < deadline:
+            resp = await self._request("GET", f"/api/v1/vms/{server_id}", ok=(200, 404))
+            if resp.status_code == 404:
+                return None
+            vm = resp.json()
+            state = vm.get("state")
+            if state == "deleting":
+                return None
+            if state in _STABLE_STATES or (
+                isinstance(state, str) and state.startswith("error")
+            ):
+                return vm
+            # None / transitional / unknown state -> keep waiting
+            await asyncio.sleep(_POLL_INTERVAL)
+        return vm  # timed out — still attempt the delete with the latest body
+
+    async def _delete_retrying_state(self, path: str) -> None:
+        """DELETE *path*, retrying through 'can not be deleted from current state'."""
+        for attempt in range(_DELETE_RETRIES + 1):
+            resp = await self._request("DELETE", path, ok=(200, 202, 204, 404, 422))
+            if resp.status_code != 422:
+                return
+            if "current_state" not in resp.text and "current state" not in resp.text:
+                raise HosterError(f"cloudru: unexpected 422 on DELETE {path}: {resp.text[:200]}")
+            if attempt < _DELETE_RETRIES:
+                await asyncio.sleep(_DELETE_RETRY_DELAY)
+        raise HosterError(f"cloudru: {path} still not deletable after retries")
 
     async def list_servers(self) -> list[ServerInfo]:
         resp = await self._request("GET", "/api/v1/vms", params={"project_id": self._project})

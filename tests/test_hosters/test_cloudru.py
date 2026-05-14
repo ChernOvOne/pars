@@ -46,38 +46,45 @@ async def test_create_full_flow(hoster: CloudRuHoster) -> None:
     create = respx.post(f"{C}/api/v1.1/vms").mock(
         return_value=httpx.Response(202, json=[{"id": "vm-1", "state": "creating"}])
     )
+    # VM gets a public IP via new_external_ip — poll until floating_ip appears
     respx.get(f"{C}/api/v1/vms/vm-1").mock(
         side_effect=[
-            httpx.Response(200, json={"id": "vm-1", "state": "creating", "interfaces": []}),
+            httpx.Response(
+                200,
+                json={
+                    "id": "vm-1",
+                    "state": "creating",
+                    "interfaces": [{"id": "if-1", "ip_address": "10.0.0.5"}],
+                },
+            ),
             httpx.Response(
                 200,
                 json={
                     "id": "vm-1",
                     "state": "running",
-                    "interfaces": [{"id": "if-1", "ip_address": "10.0.0.5"}],
+                    "interfaces": [
+                        {
+                            "id": "if-1",
+                            "ip_address": "10.0.0.5",
+                            "floating_ip": {"id": "fip-1", "ip_address": "203.0.113.50"},
+                        }
+                    ],
                 },
             ),
         ]
-    )
-    respx.get(f"{C}/api/v1/availability-zones").mock(
-        return_value=httpx.Response(200, json=[{"id": "zone-1", "name": "ru.AZ-1"}])
-    )
-    fip = respx.post(f"{C}/api/v1/floating-ips").mock(
-        return_value=httpx.Response(201, json={"id": "fip-1", "ip_address": "203.0.113.50"})
     )
 
     server = await hoster.create(name="wlfinder-x", ssh_pub_key="ssh-ed25519 AAA t", user_data=None)
 
     assert server.server_id == "vm-1"
     assert server.public_ipv4 == "203.0.113.50"
-    # create VM body is a *list* of one payload
+    # create VM body is a *list* of one payload with the corrected fields
     sent = json.loads(create.calls.last.request.content)
-    assert isinstance(sent, list) and sent[0]["flavor_name"] == "lowcost10-1-1"
+    assert isinstance(sent, list)
+    assert sent[0]["flavor_name"] == "lowcost10-1-1"
+    assert sent[0]["interfaces"][0]["type"] == "regular"
+    assert sent[0]["interfaces"][0]["new_external_ip"] is True
     assert sent[0]["image_metadata"]["public_key"] == "ssh-ed25519 AAA t"
-    # floating IP was bound to the VM interface
-    fip_body = json.loads(fip.calls.last.request.content)
-    assert fip_body["interface_id"] == "if-1"
-    assert fip_body["availability_zone_id"] == "zone-1"
 
 
 @respx.mock
@@ -100,7 +107,12 @@ async def test_delete_releases_floating_ip_first(hoster: CloudRuHoster) -> None:
     respx.post(IAM).mock(return_value=_token_ok())
     respx.get(f"{C}/api/v1/vms/vm-1").mock(
         return_value=httpx.Response(
-            200, json={"id": "vm-1", "interfaces": [{"floating_ip": {"id": "fip-1"}}]}
+            200,
+            json={
+                "id": "vm-1",
+                "state": "running",
+                "interfaces": [{"floating_ip": {"id": "fip-1"}}],
+            },
         )
     )
     del_fip = respx.delete(f"{C}/api/v1/floating-ips/fip-1").mock(
