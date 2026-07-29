@@ -275,8 +275,16 @@ class Orchestrator:
             if not servers:
                 # The whole batch failed to allocate — surface it so the
                 # worker counts it and the circuit breaker can trip.
+                # ЕСЛИ все ошибки были soft (pool_exhausted у Selectel-camp)
+                # — пропагируем этот маркер, чтобы circuit breaker не считал
+                # их «жёсткими» и не убил прогон после первых 15 попыток.
+                errs = [r for r in results if isinstance(r, BaseException)]
+                soft_marker = ""
+                if errs and all("pool_exhausted" in str(r) for r in errs):
+                    soft_marker = " (pool_exhausted)"
                 raise HosterError(
                     f"{hoster.name}: all {size} allocations in the batch failed"
+                    f"{soft_marker}"
                 )
             async with self._slot_lock:
                 # A batch that produced IPs counts as progress: clear the
