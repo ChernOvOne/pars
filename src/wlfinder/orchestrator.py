@@ -176,9 +176,17 @@ class Orchestrator:
                     # A whole batch failing (transient API outage, exhausted
                     # rate-limit) must NOT kill the run — log it, count it,
                     # take the next slot.
+                    #
+                    # `pool_exhausted` (subnet-camp: Selectel вернул 409
+                    # IpAddressGenerationFailure) — это НЕ авария, а «сейчас
+                    # свободных IP в /24 нет, попробуем ещё раз». Такой батч
+                    # НЕ должен считаться в circuit-breaker, иначе первые же
+                    # 15 попыток camp'а убьют весь прогон.
+                    is_soft = "pool_exhausted" in str(exc)
                     async with self._slot_lock:
                         self._error_count += 1
-                        self._consecutive_errors += 1
+                        if not is_soft:
+                            self._consecutive_errors += 1
                         consec = self._consecutive_errors
                     log.warning(
                         "orchestrator.batch_error",
@@ -187,8 +195,9 @@ class Orchestrator:
                         error=str(exc),
                         errors_total=self._error_count,
                         consecutive=consec,
+                        soft=is_soft,
                     )
-                    if consec >= _MAX_CONSECUTIVE_ERRORS:
+                    if not is_soft and consec >= _MAX_CONSECUTIVE_ERRORS:
                         raise HosterError(
                             f"aborting run: {consec} batches failed in a row"
                         ) from exc
