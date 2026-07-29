@@ -49,6 +49,7 @@ class CloudRuConfig(BaseModel):
     name: str
     type: Literal["cloudru"] = "cloudru"
     enabled: bool = True
+    batch_size: int | None = None
     key_id_env: str = "CLOUDRU_KEY_ID"
     key_secret_env: str = "CLOUDRU_KEY_SECRET"
     project_id_env: str = "CLOUDRU_PROJECT_ID"
@@ -61,6 +62,7 @@ class CloudRuHoster:
 
     def __init__(self, cfg: CloudRuConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._key_id = resolve_secret(cfg.key_id_env)
@@ -165,7 +167,14 @@ class CloudRuHoster:
         deadline = loop.time() + self._cfg.create_timeout_sec
         raw: dict[str, Any] = {}
         while loop.time() < deadline:
-            resp = await self._request("GET", f"/api/v1/floating-ips/{fip_id}")
+            resp = await self._request(
+                "GET", f"/api/v1/floating-ips/{fip_id}", ok=(200, 404)
+            )
+            if resp.status_code == 404:
+                # Cloud.ru is eventually consistent: a just-created floating IP
+                # can 404 for a few seconds before it shows up. Keep polling.
+                await asyncio.sleep(_POLL_INTERVAL)
+                continue
             raw = resp.json()
             ip = raw.get("ip_address") or ip
             state = str(raw.get("state", ""))

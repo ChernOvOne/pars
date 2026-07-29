@@ -43,6 +43,8 @@ class Hoster(Protocol):
     """
 
     name: str
+    # Per-hoster batch-hold size; None falls back to the orchestrator default.
+    batch_size: int | None
 
     async def create(
         self,

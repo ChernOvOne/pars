@@ -1,4 +1,11 @@
-"""The IP-roulette main loop."""
+"""The IP-roulette main loop — batch-hold edition.
+
+Each *batch* allocates ``batch_size`` IPs for one hoster and holds them all at
+once while checking them: a provider cannot hand back an IP it is still
+holding, so every IP within a batch is forced to be distinct. This is what
+stops the roulette from drawing the same handful of recycled addresses over
+and over.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +18,21 @@ import structlog
 from wlfinder.checker import WhitelistChecker
 from wlfinder.config import Config
 from wlfinder.db import Database
-from wlfinder.hosters.base import BalanceError, Hoster
+from wlfinder.hosters.base import (
+    BalanceError,
+    Hoster,
+    HosterAuthError,
+    HosterError,
+)
 from wlfinder.keeper import KeptServer, SshKeyPair, ensure_local_ssh_key, keep_server
 from wlfinder.models import Attempt, CreatedServer, SuccessfulDeployment
 from wlfinder.notifier import HitNotification, Notifier
 
 log = structlog.get_logger(__name__)
+
+# Circuit breaker: if this many batches fail in a row (every hoster erroring,
+# a network outage, ...) the run aborts instead of spinning uselessly.
+_MAX_CONSECUTIVE_ERRORS = 15
 
 
 class NoHitError(RuntimeError):
@@ -30,16 +46,18 @@ class RunResult:
     kept: KeptServer | None = None
     notified: bool = False
     cost_per_hour_rub: float | None = None
+    error_count: int = 0
 
 
 class Orchestrator:
-    """Creates servers until one IP is whitelisted.
+    """Creates servers in batches until one IP is whitelisted.
 
-    With ``orchestrator.parallel_workers > 1`` several attempts run
-    concurrently: workers pull attempt slots from a shared counter, and the
-    first whitelist hit is kept + notified while every other worker is
-    cancelled and its in-flight server deleted. With ``parallel_workers: 1``
-    this is a plain sequential loop.
+    A batch allocates ``batch_size`` IPs for one hoster and holds them all
+    simultaneously while checking — forcing the provider to hand out distinct
+    addresses across the batch. With ``parallel_workers > 1`` several batches
+    (typically on different hosters) run concurrently; the first whitelist hit
+    is kept + notified while every other worker is cancelled and its in-flight
+    IPs released.
     """
 
     def __init__(
@@ -60,15 +78,22 @@ class Orchestrator:
         self._notifier = notifier
         self._ssh_key = ssh_key or ensure_local_ssh_key()
         # Shared per-run state — (re)initialised at the top of run().
-        self._next_attempt = 0
+        self._allocated = 0
+        self._batch_index = 0
         self._slot_lock = asyncio.Lock()
         self._result: RunResult | None = None
         self._error: BaseException | None = None
         self._won = False
         self._workers: list[asyncio.Task[None]] = []
+        self._error_count = 0
+        self._consecutive_errors = 0
 
-    def _pick_hoster(self, attempt: int) -> Hoster:
-        return self._hosters[attempt % len(self._hosters)]
+    def _pick_hoster(self, batch_index: int) -> Hoster:
+        return self._hosters[batch_index % len(self._hosters)]
+
+    def _batch_size_for(self, hoster: Hoster) -> int:
+        size = hoster.batch_size or self._cfg.orchestrator.batch_size
+        return max(size, 1)
 
     async def _check_balance_or_bail(self, hoster: Hoster) -> None:
         threshold = self._cfg.orchestrator.bail_on_balance_threshold_rub
@@ -84,16 +109,20 @@ class Orchestrator:
         delay = self._cfg.orchestrator.delay_between_attempts_sec
         workers_n = min(max(self._cfg.orchestrator.parallel_workers, 1), max(limit, 1))
 
-        self._next_attempt = 0
+        self._allocated = 0
+        self._batch_index = 0
         self._slot_lock = asyncio.Lock()
         self._result = None
         self._error = None
         self._won = False
+        self._error_count = 0
+        self._consecutive_errors = 0
 
         log.info(
             "orchestrator.start",
             max_attempts=limit,
             parallel_workers=workers_n,
+            batch_size=self._cfg.orchestrator.batch_size,
             hosters=[h.name for h in self._hosters],
         )
 
@@ -104,7 +133,7 @@ class Orchestrator:
             await asyncio.gather(*self._workers, return_exceptions=True)
         except asyncio.CancelledError:
             # run() itself was cancelled (e.g. Ctrl-C): stop the workers and
-            # let them delete their in-flight servers before propagating.
+            # let them release their in-flight IPs before propagating.
             log.warning("orchestrator.interrupted")
             for w in self._workers:
                 w.cancel()
@@ -115,19 +144,59 @@ class Orchestrator:
             raise self._error
         if self._result is not None:
             return self._result
-        raise NoHitError(f"exhausted {limit} attempts without a whitelist hit")
+        raise NoHitError(
+            f"exhausted {limit} attempts without a whitelist hit "
+            f"({self._error_count} batch error(s) along the way)"
+        )
 
     async def _worker(self, limit: int, delay: int) -> None:
-        """Claim attempt slots and run them until a hit, a fatal error, or exhaustion."""
+        """Claim batch slots and run them until a hit, a fatal error, or exhaustion."""
         try:
             while True:
                 async with self._slot_lock:
-                    if self._won or self._error is not None or self._next_attempt >= limit:
+                    if self._won or self._error is not None or self._allocated >= limit:
                         return
-                    attempt = self._next_attempt
-                    self._next_attempt += 1
-                result = await self._attempt(attempt)
+                    batch_index = self._batch_index
+                    self._batch_index += 1
+                    hoster = self._pick_hoster(batch_index)
+                    size = min(self._batch_size_for(hoster), limit - self._allocated)
+                    self._allocated += size
+                    attempts_so_far = self._allocated
+                if size <= 0:
+                    return
+                try:
+                    result = await self._run_batch(
+                        batch_index, hoster, size, attempts_so_far
+                    )
+                except (BalanceError, HosterAuthError):
+                    # Fatal: out of money / broken credentials — no point
+                    # burning more batches.
+                    raise
+                except HosterError as exc:
+                    # A whole batch failing (transient API outage, exhausted
+                    # rate-limit) must NOT kill the run — log it, count it,
+                    # take the next slot.
+                    async with self._slot_lock:
+                        self._error_count += 1
+                        self._consecutive_errors += 1
+                        consec = self._consecutive_errors
+                    log.warning(
+                        "orchestrator.batch_error",
+                        batch=batch_index,
+                        hoster=hoster.name,
+                        error=str(exc),
+                        errors_total=self._error_count,
+                        consecutive=consec,
+                    )
+                    if consec >= _MAX_CONSECUTIVE_ERRORS:
+                        raise HosterError(
+                            f"aborting run: {consec} batches failed in a row"
+                        ) from exc
+                    if delay:
+                        await asyncio.sleep(delay)
+                    continue
                 if result is not None:
+                    result.error_count = self._error_count
                     self._result = result
                     self._cancel_siblings()
                     return
@@ -142,41 +211,101 @@ class Orchestrator:
             self._cancel_siblings()
 
     def _cancel_siblings(self) -> None:
-        """Cancel every other worker (its in-flight server is cleaned up on cancel)."""
+        """Cancel every other worker (its in-flight IPs are released on cancel)."""
         current = asyncio.current_task()
         for w in self._workers:
             if w is not current and not w.done():
                 w.cancel()
 
-    async def _attempt(self, attempt: int) -> RunResult | None:
-        """One create -> check -> keep/delete cycle. Returns a RunResult on a hit."""
-        hoster = self._pick_hoster(attempt)
+    async def _run_batch(
+        self, batch_index: int, hoster: Hoster, size: int, attempts_so_far: int
+    ) -> RunResult | None:
+        """Allocate ``size`` IPs at once, hold them all, then check/keep/release."""
         await self._check_balance_or_bail(hoster)
 
-        server: CreatedServer | None = None
-        attempt_id: int | None = None
+        servers: list[CreatedServer] = []
+        attempt_ids: dict[str, int] = {}
         try:
-            server = await hoster.create(
-                name=f"wlfinder-{_timestamp()}",
-                ssh_pub_key=self._ssh_key.public,
-                user_data=None,
+            # Allocate the whole batch concurrently. Every IP stays held until
+            # the batch is resolved, so the provider is forced to hand out
+            # distinct addresses across the batch.
+            results = await asyncio.gather(
+                *(
+                    hoster.create(
+                        name=f"wlfinder-{_timestamp()}",
+                        ssh_pub_key=self._ssh_key.public,
+                        user_data=None,
+                    )
+                    for _ in range(size)
+                ),
+                return_exceptions=True,
             )
-            hit = self._checker.is_whitelisted(server.public_ipv4)
-            attempt_id = await self._db.record_attempt(
-                Attempt(
-                    hoster=hoster.name,
-                    region=server.region,
-                    server_id=server.server_id,
-                    ipv4=server.public_ipv4,
-                    ipv6=server.public_ipv6,
-                    hit=hit,
-                    raw_create=server.raw or None,
-                )
+            fatal: BaseException | None = None
+            transient = 0
+            for r in results:
+                if isinstance(r, CreatedServer):
+                    servers.append(r)
+                elif isinstance(r, (BalanceError, HosterAuthError)):
+                    fatal = fatal or r
+                elif isinstance(r, BaseException):
+                    transient += 1
+
+            unique_ips = len({s.public_ipv4 for s in servers})
+            log.info(
+                "orchestrator.batch",
+                batch=batch_index,
+                hoster=hoster.name,
+                requested=size,
+                created=len(servers),
+                unique_ips=unique_ips,
+                errors=transient,
             )
 
-            if hit:
+            if fatal is not None:
+                raise fatal
+            if not servers:
+                # The whole batch failed to allocate — surface it so the
+                # worker counts it and the circuit breaker can trip.
+                raise HosterError(
+                    f"{hoster.name}: all {size} allocations in the batch failed"
+                )
+            async with self._slot_lock:
+                # A batch that produced IPs counts as progress: clear the
+                # consecutive-error streak, but still tally partial failures.
+                self._consecutive_errors = 0
+                if transient:
+                    self._error_count += transient
+
+            # Record every attempt; find the first whitelist hit in the batch.
+            hit_server: CreatedServer | None = None
+            for server in servers:
+                is_hit = self._checker.is_whitelisted(server.public_ipv4)
+                attempt_id = await self._db.record_attempt(
+                    Attempt(
+                        hoster=hoster.name,
+                        region=server.region,
+                        server_id=server.server_id,
+                        ipv4=server.public_ipv4,
+                        ipv6=server.public_ipv6,
+                        hit=is_hit,
+                        raw_create=server.raw or None,
+                    )
+                )
+                attempt_ids[server.server_id] = attempt_id
+                if is_hit:
+                    if hit_server is None:
+                        hit_server = server
+                else:
+                    log.info(
+                        "orchestrator.miss",
+                        ipv4=server.public_ipv4,
+                        hoster=hoster.name,
+                        batch=batch_index,
+                    )
+
+            if hit_server is not None:
                 # Only the first hit across all workers is kept; a later hit
-                # (parallel race) deletes its server like a miss.
+                # (parallel race) is released like a miss.
                 async with self._slot_lock:
                     we_won = not self._won
                     if we_won:
@@ -184,39 +313,50 @@ class Orchestrator:
                 if we_won:
                     log.info(
                         "orchestrator.hit",
-                        ipv4=server.public_ipv4,
+                        ipv4=hit_server.public_ipv4,
                         hoster=hoster.name,
-                        attempt=attempt + 1,
+                        batch=batch_index,
                     )
-                    result = await self._handle_hit(hoster, server, attempt + 1)
-                    server = None  # kept on purpose — do not let cleanup delete it
+                    result = await self._handle_hit(
+                        hoster, hit_server, attempts_so_far
+                    )
+                    # Release every other IP in the batch; keep the winner.
+                    losers = [s for s in servers if s is not hit_server]
+                    await self._release_all(hoster, losers, attempt_ids)
+                    servers = []  # winner kept on purpose — skip finally cleanup
                     return result
                 log.info(
                     "orchestrator.hit_superseded",
-                    ipv4=server.public_ipv4,
+                    ipv4=hit_server.public_ipv4,
                     hoster=hoster.name,
                 )
-                await hoster.delete(server.server_id)
-                await self._db.mark_deleted(attempt_id)
-                server = None
-                return None
 
-            log.info(
-                "orchestrator.miss",
-                ipv4=server.public_ipv4,
-                hoster=hoster.name,
-                attempt=attempt + 1,
-            )
-            await hoster.delete(server.server_id)
-            await self._db.mark_deleted(attempt_id)
-            server = None
+            # No kept hit — release the whole held batch.
+            await self._release_all(hoster, servers, attempt_ids)
+            servers = []
             return None
-        except BaseException:  # noqa: BLE001 - clean up the in-flight server, then re-raise
-            if server is not None:
-                await _safe_delete(hoster, server)
-                if attempt_id is not None:
-                    await self._db.mark_deleted(attempt_id)
+        except BaseException:
+            # Cancelled by a sibling's win, or a fatal error mid-batch — release
+            # whatever IPs we are still holding so nothing leaks.
+            if servers:
+                await self._release_all(hoster, servers, attempt_ids)
             raise
+
+    async def _release_all(
+        self,
+        hoster: Hoster,
+        servers: list[CreatedServer],
+        attempt_ids: dict[str, int],
+    ) -> None:
+        """Release a set of held IPs concurrently; failures are logged, not fatal."""
+
+        async def _one(server: CreatedServer) -> None:
+            await _safe_delete(hoster, server)
+            attempt_id = attempt_ids.get(server.server_id)
+            if attempt_id is not None:
+                await self._db.mark_deleted(attempt_id)
+
+        await asyncio.gather(*(_one(s) for s in servers), return_exceptions=True)
 
     async def _handle_hit(
         self, hoster: Hoster, server: CreatedServer, attempt_no: int

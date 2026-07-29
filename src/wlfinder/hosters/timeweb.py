@@ -46,6 +46,7 @@ class TimewebConfig(BaseModel):
     name: str
     type: Literal["timeweb"] = "timeweb"
     enabled: bool = True
+    batch_size: int | None = None
     token_env: str = "TIMEWEB_TOKEN"
     # Where to allocate floating IPs. Known zones: msk-1 (Moscow),
     # spb-1 / spb-2 (St. Petersburg), nsk-1 (Novosibirsk).
@@ -63,6 +64,7 @@ class TimewebHoster:
 
     def __init__(self, cfg: TimewebConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._token = resolve_secret(cfg.token_env)

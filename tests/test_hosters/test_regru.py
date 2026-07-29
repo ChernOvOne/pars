@@ -165,9 +165,28 @@ async def test_health_check_ok(hoster: RegruHoster) -> None:
     assert await hoster.health_check() is True
 
 
-async def test_get_balance_is_none(hoster: RegruHoster) -> None:
-    # REG.ru CloudVPS has no balance endpoint — must report None, not crash.
+@respx.mock
+async def test_get_balance(hoster: RegruHoster) -> None:
+    respx.get(f"{API}/balance_data").mock(
+        return_value=httpx.Response(200, json={"balance_data": {"balance": 138.94}})
+    )
+    assert await hoster.get_balance() == 138.94
+
+
+async def test_get_balance_is_none_on_error(hoster: RegruHoster) -> None:
+    # A failing balance call must degrade to None, not crash the run.
     assert await hoster.get_balance() is None
+
+
+@respx.mock
+async def test_estimate_cost_per_hour(hoster: RegruHoster) -> None:
+    respx.get(f"{API}/sizes").mock(
+        return_value=httpx.Response(
+            200,
+            json={"sizes": [{"slug": "cloud-1", "price": "1.03"}]},
+        )
+    )
+    assert await hoster.estimate_cost_per_hour() == 1.03
 
 
 @respx.mock

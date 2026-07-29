@@ -24,6 +24,10 @@ log = structlog.get_logger(__name__)
 _BASE_URL = "https://api.cloudvps.reg.ru/v1"
 _IP_POLL_INTERVAL = 2.0
 _IP_POLL_TIMEOUT = 60.0
+# A freshly created reglet rejects DELETE with 400 until it finishes
+# provisioning (status new -> active). Retry through that window.
+_DELETE_INTERVAL = 6.0
+_DELETE_TIMEOUT = 180.0
 
 
 class RegruConfig(BaseModel):
@@ -34,6 +38,7 @@ class RegruConfig(BaseModel):
     name: str
     type: Literal["regru"] = "regru"
     enabled: bool = True
+    batch_size: int | None = None
     token_env: str = "REGRU_TOKEN"
     size: str = "cloud-1"
     image: str = "ubuntu-22-04-amd64"
@@ -48,6 +53,7 @@ class RegruHoster:
 
     def __init__(self, cfg: RegruConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._token = resolve_secret(cfg.token_env)
@@ -88,14 +94,20 @@ class RegruHoster:
         if self._fingerprints is not None:
             return self._fingerprints
         listed = await self._request("GET", "/account/keys")
-        for key in listed.json().get("ssh_keys", []):
+        # The list endpoint has shipped both `ssh_keys` and `ssh_key` as the
+        # array key across API revisions — accept either.
+        body = listed.json()
+        existing = body.get("ssh_keys") or body.get("ssh_key") or []
+        for key in existing:
             if str(key.get("public_key", "")).strip() == ssh_pub_key.strip():
                 self._fingerprints = [str(key["fingerprint"])]
                 return self._fingerprints
         created = await self._request(
             "POST", "/account/keys", json={"name": "wlfinder", "public_key": ssh_pub_key}
         )
-        self._fingerprints = [str(created.json()["ssh_key"]["fingerprint"])]
+        payload = created.json()
+        key = payload.get("ssh_keys") or payload.get("ssh_key") or payload
+        self._fingerprints = [str(key["fingerprint"])]
         return self._fingerprints
 
     # -------------------------------------------------------------- protocol
@@ -107,15 +119,23 @@ class RegruHoster:
         user_data: str | None,
     ) -> CreatedServer:
         fingerprints = await self._ensure_ssh_key(ssh_pub_key)
+        # RegletCreate schema: required `size` + `image`; `region_slug` is the
+        # documented field name (not `region`). There is no `user_data` field —
+        # cloud-init is not accepted by this API, so it is ignored.
+        #
+        # `floating_ip` MUST be false: with the API default (true) the create
+        # call 500s on every request (allocating an extra reservable IP fails
+        # server-side). The reglet still comes up with its own public IPv4 in
+        # the `ip` field — that is the address the roulette checks.
         body: dict[str, Any] = {
             "name": name,
             "size": self._cfg.size,
             "image": self._cfg.image,
-            "region": self._cfg.region_slug,
+            "region_slug": self._cfg.region_slug,
             "ssh_keys": fingerprints,
+            "floating_ip": False,
         }
-        if user_data:
-            body["user_data"] = user_data  # REG.ru takes plain cloud-init, not base64
+        _ = user_data  # accepted for protocol parity; REG.ru has no user_data field
 
         resp = await self._request("POST", "/reglets", json=body, ok=(200, 201, 202))
         reglet = resp.json()["reglet"]
@@ -160,9 +180,27 @@ class RegruHoster:
         return server  # create() already provisioned a real reglet
 
     async def delete(self, server_id: str) -> None:
-        """Delete a reglet. Idempotent: a 404 (already gone) counts as success."""
-        resp = await self._request("DELETE", f"/reglets/{server_id}", ok=(200, 202, 204, 404))
-        log.info("regru.deleted", server_id=server_id, status=resp.status_code)
+        """Delete a reglet, waiting out the provisioning window.
+
+        A reglet that is still ``new`` (mid-provisioning) rejects DELETE with
+        400; it only becomes deletable once ``active``. We retry through that
+        window. Idempotent: a 404 (already gone) counts as success.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _DELETE_TIMEOUT
+        while True:
+            resp = await self._request(
+                "DELETE", f"/reglets/{server_id}", ok=(200, 202, 204, 400, 404)
+            )
+            if resp.status_code != 400:
+                log.info("regru.deleted", server_id=server_id, status=resp.status_code)
+                return
+            if loop.time() >= deadline:
+                log.warning(
+                    "regru.delete_timeout", server_id=server_id, body=resp.text[:200]
+                )
+                return
+            await asyncio.sleep(_DELETE_INTERVAL)
 
     async def list_servers(self) -> list[ServerInfo]:
         resp = await self._request("GET", "/reglets")
@@ -184,11 +222,25 @@ class RegruHoster:
         return True
 
     async def get_balance(self) -> float | None:
-        # The REG.ru CloudVPS API does not expose an account balance endpoint.
-        return None
+        """Account balance in rubles, via /balance_data."""
+        try:
+            resp = await self._request("GET", "/balance_data")
+        except HosterError:
+            return None
+        data = resp.json().get("balance_data", {})
+        balance = data.get("balance")
+        return float(balance) if balance is not None else None
 
     async def estimate_cost_per_hour(self) -> float | None:
-        # No public per-size pricing endpoint; left as best-effort unknown.
+        """Hourly price (rub) of the configured size, from /sizes."""
+        try:
+            resp = await self._request("GET", "/sizes")
+        except HosterError:
+            return None
+        for size in resp.json().get("sizes", []):
+            if str(size.get("slug")) == self._cfg.size:
+                price = size.get("price")
+                return float(price) if price is not None else None
         return None
 
 

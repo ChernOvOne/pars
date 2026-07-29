@@ -9,16 +9,27 @@ import pytest
 from wlfinder.checker import WhitelistChecker
 from wlfinder.config import Config
 from wlfinder.db import Database
-from wlfinder.hosters.base import BalanceError
+from wlfinder.hosters.base import BalanceError, HosterAuthError, HosterError
 from wlfinder.keeper import SshKeyPair
 from wlfinder.models import CreatedServer
 from wlfinder.notifier import HitNotification
-from wlfinder.orchestrator import NoHitError, Orchestrator
+from wlfinder.orchestrator import (
+    _MAX_CONSECUTIVE_ERRORS,
+    NoHitError,
+    Orchestrator,
+)
 
 
 class FakeHoster:
-    def __init__(self, name: str, ips: Sequence[str], balance: float = 1000.0) -> None:
+    def __init__(
+        self,
+        name: str,
+        ips: Sequence[str],
+        balance: float = 1000.0,
+        batch_size: int | None = 1,
+    ) -> None:
         self.name = name
+        self.batch_size = batch_size
         self._ips = list(ips)
         self._balance = balance
         self.created: list[str] = []
@@ -134,9 +145,12 @@ async def test_max_attempts_exhausted_raises(db: Database, ssh_key: SshKeyPair) 
     assert hoster.deleted == ["srv-1", "srv-2", "srv-3"]
 
 
-async def test_cleanup_deletes_in_flight_server_on_exception(
+async def test_release_failure_is_non_fatal(
     db: Database, ssh_key: SshKeyPair
 ) -> None:
+    # A hoster whose delete() always fails must not crash the run — releases
+    # are best-effort, the failure is logged and the run carries on to
+    # exhaust its attempts.
     class ExplodingHoster(FakeHoster):
         async def delete(self, server_id: str) -> None:
             raise RuntimeError("boom")
@@ -146,10 +160,30 @@ async def test_cleanup_deletes_in_flight_server_on_exception(
         _cfg(max_attempts=3), db, _checker("192.168.0.0/24"), [hoster], FakeNotifier(), ssh_key
     )
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(NoHitError):
         await orch.run()
 
-    assert hoster.created == ["srv-1"]  # created, then cleanup attempted
+    assert hoster.created == ["srv-1", "srv-2", "srv-3"]  # all attempted, none kept
+
+
+async def test_batch_hold_allocates_whole_batch_before_release(
+    db: Database, ssh_key: SshKeyPair
+) -> None:
+    # With batch_size=4, all 4 IPs of a batch are created (and held) before
+    # any are released — this is what forces the provider to hand out
+    # distinct addresses.
+    hoster = FakeHoster("h1", ["8.8.8.8"], batch_size=4)
+    orch = Orchestrator(
+        _cfg(max_attempts=4), db, _checker("192.168.0.0/24"), [hoster], FakeNotifier(), ssh_key
+    )
+
+    with pytest.raises(NoHitError):
+        await orch.run()
+
+    # one batch of 4: every IP created, then every IP released
+    assert hoster.created == ["srv-1", "srv-2", "srv-3", "srv-4"]
+    assert set(hoster.deleted) == set(hoster.created)
+    assert await db.count_attempts() == 4
 
 
 async def test_round_robin_across_hosters(db: Database, ssh_key: SshKeyPair) -> None:
@@ -240,3 +274,83 @@ async def test_parallel_workers_exhausted_raises(db: Database, ssh_key: SshKeyPa
     assert len(hoster.created) == 8
     assert set(hoster.deleted) == set(hoster.created)
     assert await db.count_attempts() == 8
+
+
+async def test_transient_hoster_error_does_not_kill_run(
+    db: Database, ssh_key: SshKeyPair
+) -> None:
+    # The first two attempts blow up with a transient HosterError; the run must
+    # survive them, count them, and still reach the whitelist hit.
+    class FlakyHoster(FakeHoster):
+        async def create(
+            self, *, name: str, ssh_pub_key: str, user_data: str | None
+        ) -> CreatedServer:
+            self._n += 1
+            if self._n <= 2:
+                raise HosterError("transient api hiccup")
+            return CreatedServer(
+                hoster=self.name,
+                server_id=f"srv-{self._n}",
+                public_ipv4="192.168.0.10",
+                region="ru-1",
+                raw={},
+            )
+
+    hoster = FlakyHoster("h1", ["unused"])
+    orch = Orchestrator(
+        _cfg(max_attempts=10), db, _checker("192.168.0.0/24"), [hoster], FakeNotifier(), ssh_key
+    )
+
+    result = await orch.run()
+
+    assert result.hit is True
+    assert result.error_count == 2
+
+
+async def test_consecutive_errors_trip_circuit_breaker(
+    db: Database, ssh_key: SshKeyPair
+) -> None:
+    # Every attempt errors — the run must abort via the circuit breaker rather
+    # than spinning through all max_attempts.
+    class BrokenHoster(FakeHoster):
+        async def create(
+            self, *, name: str, ssh_pub_key: str, user_data: str | None
+        ) -> CreatedServer:
+            self._n += 1
+            raise HosterError("always broken")
+
+    hoster = BrokenHoster("h1", ["unused"])
+    orch = Orchestrator(
+        _cfg(max_attempts=1000),
+        db,
+        _checker("192.168.0.0/24"),
+        [hoster],
+        FakeNotifier(),
+        ssh_key,
+    )
+
+    with pytest.raises(HosterError, match="in a row"):
+        await orch.run()
+
+    # tripped the breaker well before max_attempts
+    assert hoster._n <= _MAX_CONSECUTIVE_ERRORS + 2
+
+
+async def test_auth_error_is_fatal(db: Database, ssh_key: SshKeyPair) -> None:
+    # A broken token is not something to retry around — it stops the run.
+    class AuthBrokenHoster(FakeHoster):
+        async def create(
+            self, *, name: str, ssh_pub_key: str, user_data: str | None
+        ) -> CreatedServer:
+            self._n += 1
+            raise HosterAuthError("token rejected")
+
+    hoster = AuthBrokenHoster("h1", ["unused"])
+    orch = Orchestrator(
+        _cfg(max_attempts=50), db, _checker("192.168.0.0/24"), [hoster], FakeNotifier(), ssh_key
+    )
+
+    with pytest.raises(HosterAuthError):
+        await orch.run()
+
+    assert hoster._n == 1  # stopped on the very first failure

@@ -64,6 +64,11 @@ class OrchestratorConfig(BaseModel):
     delay_between_attempts_sec: int = 15
     parallel_workers: int = 1
     bail_on_balance_threshold_rub: float = 50.0
+    # batch-hold: each "batch" allocates this many IPs at once and holds them
+    # all while checking — a provider cannot hand back an IP it is still
+    # holding, so every IP within a batch is forced to be distinct. A
+    # per-hoster ``batch_size`` overrides this default.
+    batch_size: int = 6
 
 
 class HosterConfig(BaseModel):

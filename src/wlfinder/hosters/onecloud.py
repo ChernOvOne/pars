@@ -34,6 +34,7 @@ class OneCloudConfig(BaseModel):
     name: str
     type: Literal["1cloud"] = "1cloud"
     enabled: bool = True
+    batch_size: int | None = None
     token_env: str = "ONECLOUD_TOKEN"
     cpu: int = 1
     ram: int = 1024  # MB
@@ -49,6 +50,7 @@ class OneCloudHoster:
 
     def __init__(self, cfg: OneCloudConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._token = resolve_secret(cfg.token_env)

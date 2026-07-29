@@ -17,3 +17,4 @@ config.yaml
 out/
 *.db
 *.pkl
+*.log

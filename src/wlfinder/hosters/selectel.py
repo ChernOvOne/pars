@@ -1,16 +1,40 @@
-"""Selectel hoster integration (OpenStack Keystone v3 + Nova).
+"""Selectel hoster integration — floating-IP roulette (OpenStack Neutron).
 
-Auth is two-step: a service user gets a Keystone token from
-cloud.api.selcloud.ru, then that token is used against the OpenStack Nova
-API at ``<region>.cloud.api.selcloud.ru``. The most complex hoster — the
-flavor / image / network IDs must be looked up once in your project and
-put into config.yaml.
+Auth is OpenStack Keystone v3: a *service user* (created once from the account
+API key) gets a token scoped to the project, which then drives the per-region
+Neutron API at ``<region>.cloud.api.selcloud.ru/network``. The roulette
+allocates standalone floating IPs (no VM at all), checks each address against
+the whitelist, and releases — distinct addresses are forced by holding a whole
+batch at once.
+
+Two Selectel-specific gotchas, both learned the hard way:
+- the Keystone **domain name is the account NUMBER** (e.g. ``599260``), NOT the
+  legacy selvpc id;
+- the floating-IP quota is **per region**; some regions (e.g. ru-2) ship with a
+  zero quota, so run the roulette in regions that have one (ru-1, ru-3, ru-8…).
+
+Two roles must be assigned to the service user in the project:
+- ``compute.admin`` — needed for the promote-on-hit path (build a VM);
+- ``vpc.external_access.admin`` — required since 2026-07 to POST /floatingips;
+  without it Neutron replies 403 ``rule:create_floatingip is disallowed by
+  policy`` and the roulette is dead in the water.
+
+Subnet camping (``target_subnet_cidr`` in config)
+-------------------------------------------------
+When a target CIDR is set, ``create()`` refuses to hand back an IP outside
+that /24 by passing ``subnet_id`` to Neutron. Selectel's popular /24s are
+usually 100 % allocated to other tenants, so ``POST /floatingips`` will reply
+409 ``IpAddressGenerationFailure`` most of the time — that is not an error but
+"pool is currently full, try again". We raise :class:`HosterError` with the
+tag ``pool_exhausted``; the orchestrator counts the batch as a soft failure
+and picks the next slot, so many tight loops eventually catch an IP the
+moment its previous owner releases it. The winning IP is guaranteed to fall
+inside the target /24 — no more roulette, only camping.
 """
 
 from __future__ import annotations
 
-import asyncio
-import base64
+import ipaddress
 import time
 from datetime import datetime
 from typing import Any, Literal
@@ -27,15 +51,17 @@ from wlfinder.models import ServerInfo
 log = structlog.get_logger(__name__)
 
 _KEYSTONE_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
-_IP_POLL_INTERVAL = 3.0
-_IP_POLL_TIMEOUT = 180.0
 
 
 class SelectelConfig(BaseModel):
     """The slice of ``config.yaml`` that a Selectel hoster needs.
 
-    ``flavor_id`` / ``image_id`` / ``network_id`` are OpenStack UUIDs — look
-    them up once in the Selectel panel or via the Nova/Neutron APIs.
+    wlfinder allocates *floating IPs* here, so only the service-user
+    credentials, the project and the region are required. The external network
+    is auto-discovered per region unless ``external_network_id`` is pinned.
+
+    ``target_subnet_cidr`` turns on camp mode: every create() will only accept
+    an IP from that /24 (see module docstring for the details).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -43,21 +69,25 @@ class SelectelConfig(BaseModel):
     name: str
     type: Literal["selectel"] = "selectel"
     enabled: bool = True
+    batch_size: int | None = None
     account_id_env: str = "SELECTEL_ACCOUNT_ID"
     service_user_env: str = "SELECTEL_SERVICE_USER"
     service_pass_env: str = "SELECTEL_SERVICE_PASS"
     project_id_env: str = "SELECTEL_PROJECT_ID"
-    region: str = "ru-2"
-    flavor_id: str
-    image_id: str
-    network_id: str
+    region: str = "ru-1"
+    external_network_id: str | None = None
+    # Целевая /24 (или /25 и т.п.) — если задана, floating IP будет пиниться в
+    # ЭТУ конкретную подсеть через subnet_id, а не браться рандомно из пула
+    # региона. Значение — CIDR-строка, например "46.182.24.0/24".
+    target_subnet_cidr: str | None = None
 
 
 class SelectelHoster:
-    """Thin async client over Selectel's OpenStack Keystone + Nova APIs."""
+    """Floating-IP roulette client over Selectel's OpenStack Keystone + Neutron."""
 
     def __init__(self, cfg: SelectelConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._account_id = resolve_secret(cfg.account_id_env)
@@ -66,16 +96,25 @@ class SelectelHoster:
         self._project_id = resolve_secret(cfg.project_id_env)
         self._token: str | None = None
         self._token_expiry = 0.0
-        self._key_name: str | None = None
+        self._external_net: str | None = cfg.external_network_id
+        # Ленивое сопоставление target_subnet_cidr → subnet_id (заполняется
+        # первым же create()-запросом, потом кешируется до перезапуска).
+        self._target_subnet_id: str | None = None
+        self._target_cidr: ipaddress.IPv4Network | None = (
+            ipaddress.ip_network(cfg.target_subnet_cidr, strict=False)  # type: ignore[assignment]
+            if cfg.target_subnet_cidr
+            else None
+        )
 
     @classmethod
     def from_config(cls, raw: dict[str, Any], client: httpx.AsyncClient) -> SelectelHoster:
         return cls(SelectelConfig.model_validate(raw), client)
 
     @property
-    def _compute_url(self) -> str:
-        return f"https://{self._cfg.region}.cloud.api.selcloud.ru/compute/v2.1"
+    def _network_url(self) -> str:
+        return f"https://{self._cfg.region}.cloud.api.selcloud.ru/network/v2.0"
 
+    # ----------------------------------------------------------------- auth
     async def _ensure_token(self) -> str:
         if self._token is not None and time.time() < self._token_expiry - 60:
             return self._token
@@ -86,6 +125,7 @@ class SelectelHoster:
                     "password": {
                         "user": {
                             "name": self._user.get_secret_value(),
+                            # Keystone domain name == Selectel account number.
                             "domain": {"name": self._account_id.get_secret_value()},
                             "password": self._password.get_secret_value(),
                         }
@@ -119,15 +159,16 @@ class SelectelHoster:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         ok: tuple[int, ...] = (200, 201, 202, 204),
     ) -> httpx.Response:
-        url = f"{self._compute_url}{path}"
+        url = f"{self._network_url}{path}"
         token = await self._ensure_token()
         try:
             return await request_with_retries(
                 self._client, method, url,
                 headers={"X-Auth-Token": token, "Content-Type": "application/json"},
-                json=json, ok=ok, label="selectel",
+                json=json, params=params, ok=ok, label="selectel",
             )
         except HosterAuthError:
             self._token = None  # expired — refresh once and retry
@@ -135,27 +176,65 @@ class SelectelHoster:
             return await request_with_retries(
                 self._client, method, url,
                 headers={"X-Auth-Token": token, "Content-Type": "application/json"},
-                json=json, ok=ok, label="selectel",
+                json=json, params=params, ok=ok, label="selectel",
             )
 
-    async def _ensure_ssh_key(self, ssh_pub_key: str) -> str:
-        if self._key_name is not None:
-            return self._key_name
-        listed = await self._request("GET", "/os-keypairs")
-        for entry in listed.json().get("keypairs", []):
-            kp = entry.get("keypair", entry)
-            if str(kp.get("public_key", "")).strip() == ssh_pub_key.strip():
-                self._key_name = str(kp["name"])
-                return self._key_name
-        await self._request(
-            "POST",
-            "/os-keypairs",
-            json={"keypair": {"name": "wlfinder", "public_key": ssh_pub_key}},
-            ok=(200, 201),
+    async def _ensure_external_net(self) -> str:
+        if self._external_net is not None:
+            return self._external_net
+        resp = await self._request(
+            "GET", "/networks", params={"router:external": "true"}
         )
-        self._key_name = "wlfinder"
-        return self._key_name
+        nets = resp.json().get("networks", [])
+        if not nets:
+            raise HosterError(
+                f"selectel: no external network in region {self._cfg.region}"
+            )
+        self._external_net = str(nets[0]["id"])
+        log.info(
+            "selectel.external_net",
+            hoster=self.name,
+            region=self._cfg.region,
+            network_id=self._external_net,
+        )
+        return self._external_net
 
+    async def _ensure_target_subnet_id(self) -> str | None:
+        """При включённом camp-режиме резолвит CIDR → Neutron subnet_id.
+
+        Один HTTP-запрос за инстанс (кеш живёт до перезапуска). Если целевой
+        CIDR не найден в external pool региона — сразу выбрасываем
+        HosterError, потому что дальше POST /floatingips с чужим subnet_id
+        всё равно даст 400.
+        """
+        if self._target_cidr is None:
+            return None
+        if self._target_subnet_id is not None:
+            return self._target_subnet_id
+        resp = await self._request("GET", "/floatingip_pools")
+        for pool in resp.json().get("floatingip_pools", []):
+            cidr = pool.get("cidr")
+            if not cidr:
+                continue
+            try:
+                pool_net = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                continue
+            if pool_net == self._target_cidr:
+                self._target_subnet_id = str(pool["subnet_id"])
+                log.info(
+                    "selectel.target_subnet_resolved",
+                    hoster=self.name,
+                    cidr=str(self._target_cidr),
+                    subnet_id=self._target_subnet_id,
+                )
+                return self._target_subnet_id
+        raise HosterError(
+            f"selectel: target subnet {self._target_cidr} is not present in "
+            f"the external pool of region {self._cfg.region}"
+        )
+
+    # ------------------------------------------------------------- protocol
     async def create(
         self,
         *,
@@ -163,69 +242,85 @@ class SelectelHoster:
         ssh_pub_key: str,
         user_data: str | None,
     ) -> CreatedServer:
-        key_name = await self._ensure_ssh_key(ssh_pub_key)
-        server: dict[str, Any] = {
-            "name": name,
-            "flavorRef": self._cfg.flavor_id,
-            "imageRef": self._cfg.image_id,
-            "networks": [{"uuid": self._cfg.network_id}],
-            "key_name": key_name,
-        }
-        if user_data:
-            server["user_data"] = base64.b64encode(user_data.encode()).decode()
+        """Allocate a standalone floating IPv4. ``ssh_pub_key``/``user_data``
+        are unused — no VM is created, only an IP to test.
 
-        resp = await self._request("POST", "/servers", json={"server": server}, ok=(200, 202))
-        server_id = str(resp.json()["server"]["id"])
-
-        ipv4, raw = await self._poll_for_ip(server_id)
-        if ipv4 is None:
-            raise HosterError(
-                f"selectel: server {server_id} got no IPv4 within {_IP_POLL_TIMEOUT:.0f}s"
+        In camp mode (``target_subnet_cidr`` set) we pass ``subnet_id`` so the
+        IP is forced into that specific /24. A 409 ``IpAddressGenerationFailure``
+        means the /24 is momentarily 100 % allocated to other tenants —
+        raise :class:`HosterError` with a ``pool_exhausted`` marker so the
+        orchestrator treats the batch as a soft miss and tries again.
+        """
+        ext = await self._ensure_external_net()
+        subnet_id = await self._ensure_target_subnet_id()
+        body: dict[str, Any] = {"floating_network_id": ext}
+        if subnet_id:
+            body["subnet_id"] = subnet_id
+        try:
+            resp = await self._request(
+                "POST",
+                "/floatingips",
+                json={"floatingip": body},
+                ok=(200, 201),
             )
+        except HosterError as exc:
+            # request_with_retries сериализует тело ошибки в str(exc),
+            # ищем в нём маркер Neutron'а.
+            if "IpAddressGenerationFailure" in str(exc):
+                raise HosterError(
+                    f"selectel: pool_exhausted — {self._target_cidr or 'region '+self._cfg.region} "
+                    f"has no free IPs right now (retry)"
+                ) from exc
+            raise
+        fip = resp.json()["floatingip"]
+        fip_id = str(fip["id"])
+        ip = fip.get("floating_ip_address")
+        if not ip:
+            await self._safe_release(fip_id)
+            raise HosterError(f"selectel: floating IP {fip_id} came back without an address")
         return CreatedServer(
             hoster=self.name,
-            server_id=server_id,
-            public_ipv4=ipv4,
+            server_id=fip_id,
+            public_ipv4=str(ip),
             region=self._cfg.region,
-            raw=raw,
+            raw=fip,
         )
 
-    async def _poll_for_ip(self, server_id: str) -> tuple[str | None, dict[str, Any]]:
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + _IP_POLL_TIMEOUT
-        server: dict[str, Any] = {}
-        while loop.time() < deadline:
-            await asyncio.sleep(_IP_POLL_INTERVAL)
-            resp = await self._request("GET", f"/servers/{server_id}")
-            server = resp.json()["server"]
-            ipv4 = _extract_ipv4(server)
-            if ipv4 is not None:
-                return ipv4, server
-        return None, server
-
     async def promote(self, server: CreatedServer, ssh_pub_key: str) -> CreatedServer:
-        return server  # create() already provisioned a real server
+        # Notify-only: a hit keeps the whitelisted floating IP reserved. Attach
+        # it to a server manually (the IP is the prize, not a running VM).
+        log.info("selectel.promote_skipped", floating_ip=server.public_ipv4)
+        return server
 
     async def delete(self, server_id: str) -> None:
-        resp = await self._request("DELETE", f"/servers/{server_id}", ok=(200, 202, 204, 404))
-        log.info("selectel.deleted", server_id=server_id, status=resp.status_code)
+        """Release a floating IP. ``server_id`` is the floating-IP id."""
+        resp = await self._request(
+            "DELETE", f"/floatingips/{server_id}", ok=(200, 202, 204, 404)
+        )
+        log.info("selectel.released", floating_ip_id=server_id, status=resp.status_code)
+
+    async def _safe_release(self, fip_id: str) -> None:
+        try:
+            await self.delete(fip_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            log.error("selectel.cleanup_failed", floating_ip_id=fip_id, error=str(exc))
 
     async def list_servers(self) -> list[ServerInfo]:
-        resp = await self._request("GET", "/servers/detail")
+        resp = await self._request("GET", "/floatingips")
         return [
             ServerInfo(
                 hoster=self.name,
-                server_id=str(s["id"]),
-                name=str(s.get("name", "")),
-                public_ipv4=_extract_ipv4(s),
+                server_id=str(f["id"]),
+                name=str(f.get("description", "")),
+                public_ipv4=f.get("floating_ip_address"),
                 region=self._cfg.region,
             )
-            for s in resp.json().get("servers", [])
+            for f in resp.json().get("floatingips", [])
         ]
 
     async def health_check(self) -> bool:
         await self._ensure_token()
-        await self._request("GET", "/servers")
+        await self._request("GET", "/floatingips")
         log.info("selectel.health", hoster=self.name)
         return True
 
@@ -233,25 +328,7 @@ class SelectelHoster:
         return None  # Selectel billing is a separate API.
 
     async def estimate_cost_per_hour(self) -> float | None:
-        return None
-
-
-def _extract_ipv4(server: dict[str, Any]) -> str | None:
-    """Pull an IPv4 out of a Nova ``addresses`` map, preferring a floating IP."""
-    addresses = server.get("addresses")
-    if not isinstance(addresses, dict):
-        return None
-    floating: str | None = None
-    fixed: str | None = None
-    for entries in addresses.values():
-        for entry in entries:
-            if entry.get("version") != 4 or not entry.get("addr"):
-                continue
-            if entry.get("OS-EXT-IPS:type") == "floating":
-                floating = str(entry["addr"])
-            else:
-                fixed = fixed or str(entry["addr"])
-    return floating or fixed
+        return None  # floating IPs are cheap and billed separately
 
 
 def _parse_iso(value: str) -> float:

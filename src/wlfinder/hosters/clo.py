@@ -35,6 +35,7 @@ class CloConfig(BaseModel):
     name: str
     type: Literal["clo"] = "clo"
     enabled: bool = True
+    batch_size: int | None = None
     token_env: str = "CLO_TOKEN"
     flavor: str  # plan / flavor id or slug
     image: str  # OS image id or slug
@@ -47,6 +48,7 @@ class CloHoster:
 
     def __init__(self, cfg: CloConfig, client: httpx.AsyncClient) -> None:
         self.name = cfg.name
+        self.batch_size = cfg.batch_size
         self._cfg = cfg
         self._client = client
         self._token = resolve_secret(cfg.token_env)

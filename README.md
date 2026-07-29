@@ -98,7 +98,7 @@ Cloud, REG.ru CloudVPS, Selectel, Cloud.ru, CLO.ru, 1cloud, Telegram-бот + `c
 |-----|-----------|
 | Timeweb Cloud | Панель → API и терминал → [Токены API](https://timeweb.cloud/my/api-keys) |
 | REG.ru CloudVPS | ЛК → Облачные серверы → Настройки → Токен для API |
-| Selectel | Панель → Управление доступом → сервисный пользователь (OpenStack) |
+| Selectel | Панель → Управление доступом → сервисный пользователь (OpenStack). **Роли обязательны:** `compute.admin` + `vpc.external_access.admin` (иначе `create_floatingip` вернёт 403). |
 | Cloud.ru | Личный кабинет → ключи доступа: Key ID + Key Secret (OAuth2) |
 | CLO.ru | Личный кабинет → раздел API → токен |
 | 1cloud | Панель → раздел API → ключ |
@@ -144,6 +144,46 @@ pars destroy --all --yes      [Phase 4] снести все wlfinder-* серв�
 - **`config.yaml`** — параметры: хостеры, регионы, тарифы, `max_attempts`,
   паузы, источники whitelist, `notify.telegram.chat_id`, порог баланса.
 - **`.env`** — секреты: API-токены хостеров, токен Telegram-бота.
+
+### Selectel: subnet-camp (гарантированное попадание в конкретную /24)
+
+Обычная рулетка выдаёт случайный floating IP из пула региона — шанс попасть в
+whitelist'ную /24 обычно 1-3%. Selectel позволяет **прицельно** запросить IP
+из конкретной подсети через `subnet_id` в Neutron API. Включается опцией
+`target_subnet_cidr` на уровне хостера:
+
+```yaml
+- name: selectel-ru3-87.228.101
+  type: selectel
+  enabled: true
+  account_id_env: SELECTEL_ACCOUNT_ID
+  service_user_env: SELECTEL_SERVICE_USER
+  service_pass_env: SELECTEL_SERVICE_PASS
+  project_id_env: SELECTEL_PROJECT_ID
+  region: ru-3
+  target_subnet_cidr: 87.228.101.0/24    # ← пиннит выдачу в эту /24
+  batch_size: 1
+```
+
+Как это работает:
+1. На первом запросе `create()` тянет `GET /floatingip_pools` и находит
+   `subnet_id` целевой /24 (или падает с `HosterError`, если её нет в пуле
+   региона).
+2. Каждый `POST /floatingips` шлётся с этим `subnet_id`.
+3. Популярные whitelist'ные /24 обычно 100% заняты клиентами Selectel —
+   Neutron отвечает `409 IpAddressGenerationFailure`. Это НЕ ошибка: адаптер
+   бросает `HosterError("pool_exhausted — ...")`, orchestrator считает батч
+   soft-miss и берёт следующий слот. Как только чей-то IP освобождается —
+   wlfinder ловит его первым же запросом с **гарантированным попаданием** в
+   /24.
+
+Дефолтный `config.example.yaml` кампит 8 самых плотных /24 в Selectel (см.
+`src/wlfinder/config.example.yaml`, снимок на 2026-07-29). Свежая карта
+подсетей vs whitelist — `pars asn-stats`.
+
+**Роли service-user'а обязательно:** `compute.admin` + `vpc.external_access.admin`
+(вторая роль появилась в требованиях Selectel в июле 2026; без неё
+`POST /floatingips` возвращает 403).
 
 ## FAQ
 
