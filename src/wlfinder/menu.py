@@ -34,6 +34,7 @@ _MENU: list[tuple[str, str, str]] = [
     # ─── Прогон ───
     ("7", "🧪  Пробный прогон (--dry-run, ничего не создаёт)", "dry"),
     ("8", "▶️   ЗАПУСТИТЬ поиск белого IP", "run"),
+    ("m", "📺  Live-дашборд текущего прогона", "monitor"),
     ("9", "📚  Статистика прошлых прогонов", "stats"),
     # ─── Прочее ───
     ("5", "💬  Проверить Telegram-уведомления", "notify"),
@@ -183,6 +184,14 @@ def _dispatch(action: str, config: Path) -> None:
             default=False,
         )
         asyncio.run(cli._scan(cfg, config, apply=apply, min_verified=1))
+    elif action == "monitor":
+        from wlfinder.monitor import run_monitor
+        default_log = Path("run-loop.log")
+        path_str = Prompt.ask(
+            "Путь к лог-файлу прогона",
+            default=str(default_log if default_log.exists() else "run-loop.log"),
+        )
+        run_monitor(Path(path_str).expanduser())
     elif action == "dry":
         asyncio.run(cli._run(cfg, [], None, dry_run=True))
     elif action == "stats":

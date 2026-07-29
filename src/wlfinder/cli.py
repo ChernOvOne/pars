@@ -436,6 +436,26 @@ def _print_overlap(o: AsnOverlap) -> None:
     console.print()
 
 
+# ------------------------------------------------------------------------ monitor
+@app.command()
+def monitor(
+    logfile: Path = typer.Argument(
+        Path("run-loop.log"), help="Путь к лог-файлу текущего прогона."
+    ),
+) -> None:
+    """Live-дашборд текущего прогона (Rich TUI).
+
+    Читает growing log-файл в реальном времени, парсит structlog-события,
+    рисует сводку + таблицу по хостерам + шатал последних событий. При
+    HIT — большая зелёная панель с IP и SSH-командой.
+
+    Работает и с уже запущенным прогоном: если ``pars run > run.log &`` —
+    ``pars monitor run.log`` подхватит его с текущего момента.
+    """
+    from wlfinder.monitor import run_monitor
+    run_monitor(logfile)
+
+
 # --------------------------------------------------------------------------- scan
 @app.command()
 def scan(
