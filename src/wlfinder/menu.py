@@ -18,20 +18,27 @@ from wlfinder import __version__, cli
 
 console = Console()
 
-# (key, label, action) — order is the on-screen order.
+# (key, label, action) — порядок = порядок на экране.
+# Разделители "" в label — вставляют пустую строку перед пунктом.
 _MENU: list[tuple[str, str, str]] = [
-    ("1", "Настройка — создать config.yaml из шаблона", "init"),
-    ("t", "Инструкция: как получить токены/ключи API", "tokens"),
-    ("2", "Обновить базу whitelist", "wl_update"),
-    ("3", "Показать статус базы whitelist", "wl_stats"),
-    ("4", "Проверить хостеров (токены, баланс)", "ping"),
-    ("5", "Проверить Telegram-уведомления", "notify"),
-    ("6", "ASN-статистика — шансы попадания по хостерам", "asn"),
-    ("7", "Пробный прогон (--dry-run, без создания серверов)", "dry"),
-    ("8", "▶  ЗАПУСТИТЬ поиск IP", "run"),
-    ("9", "Статистика прошлых запусков", "stats"),
-    ("d", "⚠  Удалить ВСЕ wlfinder-серверы (паник-кнопка)", "destroy"),
-    ("0", "Выход", "quit"),
+    # ─── Первичная настройка ───
+    ("1", "📋  Создать config.yaml + .env из шаблонов", "init"),
+    ("t", "📖  Инструкция: как получить токены/ключи API", "tokens"),
+    # ─── Whitelist ───
+    ("2", "🔄  Обновить базу whitelist (TWL)", "wl_update"),
+    ("3", "📊  Статус базы whitelist", "wl_stats"),
+    # ─── Хостеры ───
+    ("4", "🩺  Проверить всех хостеров (доступ + баланс)", "ping"),
+    ("s", "🔍  Скан Selectel: найти /24 в TWL и обновить config", "scan"),
+    ("6", "📈  ASN-статистика — шансы попадания по хостерам", "asn"),
+    # ─── Прогон ───
+    ("7", "🧪  Пробный прогон (--dry-run, ничего не создаёт)", "dry"),
+    ("8", "▶️   ЗАПУСТИТЬ поиск белого IP", "run"),
+    ("9", "📚  Статистика прошлых прогонов", "stats"),
+    # ─── Прочее ───
+    ("5", "💬  Проверить Telegram-уведомления", "notify"),
+    ("d", "⚠️   Снести ВСЕ wlfinder-серверы (паник-кнопка)", "destroy"),
+    ("0", "🚪  Выход", "quit"),
 ]
 
 
@@ -56,15 +63,57 @@ def _resolve_menu_config(config: Path) -> Path:
     return chosen
 
 
+def _short_status(config: Path) -> str:
+    """Короткая диагностика: что настроено, что нет — для приветствия."""
+    lines: list[str] = []
+    # .env
+    env_path = config.with_name(".env")
+    if env_path.exists():
+        lines.append("[green]✓[/green] .env найден")
+    else:
+        lines.append("[yellow]•[/yellow] .env не создан (пункт 1)")
+    # config → сколько хостеров включено
+    try:
+        cfg = cli._load_config(config)
+        by_type: dict[str, int] = {}
+        for h in cfg.enabled_hosters:
+            by_type[h.type] = by_type.get(h.type, 0) + 1
+        if by_type:
+            summary = ", ".join(f"{v}× {k}" for k, v in by_type.items())
+            lines.append(f"[green]✓[/green] хостеров включено: {summary}")
+        else:
+            lines.append("[yellow]•[/yellow] в config.yaml нет включённых хостеров")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[red]✗[/red] config.yaml битый: {exc}")
+    # whitelist cache
+    try:
+        import pickle
+        cache_path = Path(cfg.general.cache_dir).expanduser() / "whitelist.pkl"
+        if cache_path.exists():
+            with cache_path.open("rb") as fh:
+                cache = pickle.load(fh)
+            n = getattr(cache, "networks", None)
+            n_count = len(n) if n is not None else "?"
+            lines.append(f"[green]✓[/green] whitelist в кэше: {n_count:,} сетей")
+        else:
+            lines.append("[yellow]•[/yellow] whitelist ещё не скачивался (пункт 2)")
+    except Exception:  # noqa: BLE001
+        lines.append("[yellow]•[/yellow] кэш whitelist пуст или устарел")
+    return "\n".join(lines)
+
+
 def run_menu(config: Path) -> None:
-    """Show the interactive menu loop until the user picks Exit."""
+    """Основной цикл интерактивного меню. Выход — по пункту 0."""
     config = _resolve_menu_config(config)
+    status = _short_status(config)
     console.print(
         Panel.fit(
             f"[bold]wlfinder[/bold]  ·  v{__version__}\n"
-            "IP-рулетка по белым спискам мобильных операторов РФ\n"
-            f"[dim]конфиг: {config}[/dim]",
+            "[dim]IP-рулетка по белым спискам мобильных операторов РФ[/dim]\n"
+            f"[dim]конфиг: {config}[/dim]\n\n"
+            f"{status}",
             border_style="cyan",
+            title="🎯  Главное меню",
         )
     )
     while True:
@@ -128,6 +177,12 @@ def _dispatch(action: str, config: Path) -> None:
         asyncio.run(cli._notify_test(cfg))
     elif action == "asn":
         asyncio.run(cli._asn_stats(cfg))
+    elif action == "scan":
+        apply = Confirm.ask(
+            "Записать найденные /24 в config.yaml? (--apply)",
+            default=False,
+        )
+        asyncio.run(cli._scan(cfg, config, apply=apply, min_verified=1))
     elif action == "dry":
         asyncio.run(cli._run(cfg, [], None, dry_run=True))
     elif action == "stats":

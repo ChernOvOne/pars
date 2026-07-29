@@ -436,6 +436,211 @@ def _print_overlap(o: AsnOverlap) -> None:
     console.print()
 
 
+# --------------------------------------------------------------------------- scan
+@app.command()
+def scan(
+    config: Path = ConfigOption,
+    apply: bool = typer.Option(
+        False, "--apply", help="Записать найденные /24 в config.yaml как camp-хостеров."
+    ),
+    min_verified: int = typer.Option(
+        1, "--min", help="Минимум TWL-verified IP на /24, чтобы попасть в отчёт."
+    ),
+) -> None:
+    """Скан: пересекает external-подсети Selectel с TWL-whitelist.
+
+    Автоматически:
+      1. авторизуется в Selectel по SERVICE_* переменным из .env;
+      2. тянет /floatingip_pools по всем регионам (272 подсети типично);
+      3. подгружает свежий TWL;
+      4. считает сколько TWL-verified IP попадает в каждую /24;
+      5. печатает таблицу «регион / CIDR / TWL / статус в config»;
+      6. по флагу --apply — обновляет config.yaml, добавляя недостающих
+         selectel-camp хостеров и удаляя неактуальных.
+
+    Никакого ручного curl'а — всё внутри процесса.
+    """
+    cfg = _load_config(config)
+    asyncio.run(_scan(cfg, config, apply=apply, min_verified=min_verified))
+
+
+async def _scan(cfg: Config, config_path: Path, *, apply: bool, min_verified: int) -> None:
+    import ipaddress
+
+    from wlfinder.hosters.selectel import SelectelConfig, SelectelHoster
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        # Свежий TWL
+        console.print("[dim]загружаю whitelist (TWL)…[/dim]")
+        store = WhitelistStore(cfg.whitelist, cfg.general.cache_dir, client)
+        checker = await store.get_checker()
+        console.print(f"[dim]  TWL: {checker.network_count:,} collapsed сетей[/dim]")
+
+        # Кредо-донор: первый включённый selectel в config.yaml.
+        selectel_cfgs = [h for h in cfg.enabled_hosters if h.type == "selectel"]
+        if not selectel_cfgs:
+            console.print(
+                "[red]В config.yaml нет ни одного включённого selectel-хостера — "
+                "нельзя определить, какими кредами логиниться.[/red]"
+            )
+            raise typer.Exit(1)
+        creds_dict = selectel_cfgs[0].as_dict()
+
+        # Обходим все регионы, тянем /floatingip_pools
+        REGIONS = ["ru-1", "ru-3", "ru-7", "ru-8", "ru-9"]
+        console.print(f"[dim]тяну /floatingip_pools по {len(REGIONS)} регионам…[/dim]")
+        pools: list[tuple[str, ipaddress.IPv4Network, str]] = []
+        for region in REGIONS:
+            probe_cfg = SelectelConfig.model_validate(
+                {**creds_dict, "name": f"scan-{region}", "region": region}
+            )
+            hoster = SelectelHoster(probe_cfg, client)
+            try:
+                region_pools = await hoster.list_floating_ip_pools()
+            except HosterError as exc:
+                console.print(f"  [yellow]{region}: {exc}[/yellow]")
+                continue
+            for p in region_pools:
+                cidr = p.get("cidr")
+                sid = p.get("subnet_id")
+                if not cidr or not sid:
+                    continue
+                try:
+                    pools.append((region, ipaddress.ip_network(cidr, strict=False), sid))
+                except ValueError:
+                    pass
+            console.print(f"[dim]  {region}: {len(region_pools)} pools[/dim]")
+
+        # count_overlap(net) даёт точное число whitelist-IP, попадающих в
+        # данную /24 (учитывает и одиночные /32, и широкие CIDR-hits).
+        matches: list[tuple[str, ipaddress.IPv4Network, str, int]] = []
+        for region, net, sid in pools:
+            count = checker.count_overlap(net)
+            if count >= min_verified:
+                matches.append((region, net, sid, count))
+
+        matches.sort(key=lambda m: (-m[3], m[0], str(m[1])))
+        console.print()
+
+        # Какие уже в конфиге как camp?
+        camp_cidrs = {
+            str(h.as_dict().get("target_subnet_cidr"))
+            for h in selectel_cfgs
+            if h.as_dict().get("target_subnet_cidr")
+        }
+
+        table = Table(
+            title=f"Selectel × TWL — {len(matches)} подсетей в whitelist",
+            title_style="bold cyan",
+        )
+        table.add_column("регион", style="cyan")
+        table.add_column("CIDR")
+        table.add_column("TWL IP", justify="right", style="magenta")
+        table.add_column("в config?", justify="center")
+        table.add_column("рекомендация")
+
+        for region, net, _sid, count in matches:
+            in_config = str(net) in camp_cidrs
+            if count >= 40:
+                reco = "[green bold]плотная — приоритет[/green bold]"
+            elif count >= 5:
+                reco = "[green]камп-кандидат[/green]"
+            elif count >= 1:
+                reco = "[yellow]тонкий след[/yellow]"
+            else:
+                reco = "[dim]—[/dim]"
+            table.add_row(
+                region,
+                str(net),
+                str(count),
+                "[green]✓[/green]" if in_config else "[dim]—[/dim]",
+                reco,
+            )
+        console.print(table)
+
+        # Что делать
+        if not apply:
+            missing = [m for m in matches if str(m[1]) not in camp_cidrs]
+            stale = [c for c in camp_cidrs if c not in {str(m[1]) for m in matches}]
+            console.print()
+            if missing:
+                console.print(
+                    f"[yellow]{len(missing)} подсетей в TWL, но не в config.yaml.[/yellow]"
+                )
+            if stale:
+                console.print(
+                    f"[yellow]{len(stale)} camp-хостеров в config.yaml больше не в TWL "
+                    f"(фантомные): {', '.join(sorted(stale))}[/yellow]"
+                )
+            if missing or stale:
+                console.print("[dim]Запусти `pars scan --apply` чтобы обновить config.yaml.[/dim]")
+            else:
+                console.print("[green]config.yaml синхронизирован с TWL ✓[/green]")
+            return
+
+        # --apply: перезаписываем блок selectel-хостеров в config.yaml
+        _apply_scan_to_config(config_path, creds_dict, matches)
+
+
+def _apply_scan_to_config(
+    config_path: Path,
+    creds_dict: dict,
+    matches: list,
+) -> None:
+    """Переписать selectel-хостеров в config.yaml согласно результатам scan.
+
+    Сохраняет остальные разделы (whitelist, orchestrator, notify, non-selectel
+    хостеров) без изменений — генерирует блок только для type: selectel.
+    """
+    import yaml
+
+    with config_path.open() as f:
+        raw = yaml.safe_load(f) or {}
+
+    # Оставить не-selectel хостеров, добавить свежих selectel
+    non_selectel = [h for h in raw.get("hosters", []) if h.get("type") != "selectel"]
+
+    creds_keys = (
+        "account_id_env",
+        "service_user_env",
+        "service_pass_env",
+        "project_id_env",
+    )
+    creds_only = {k: creds_dict.get(k) for k in creds_keys if creds_dict.get(k)}
+
+    new_selectel = []
+    for region, net, _sid, count in matches:
+        # Имя: "selectel-<region>-<первый.второй.третий>" без последнего октета
+        octets = str(net.network_address).split(".")
+        name = f"selectel-{region}-{octets[0]}.{octets[1]}.{octets[2]}"
+        new_selectel.append(
+            {
+                "name": name,
+                "type": "selectel",
+                "enabled": True,
+                **creds_only,
+                "region": region,
+                "target_subnet_cidr": str(net),
+                "batch_size": 1,
+            }
+        )
+
+    raw["hosters"] = non_selectel + new_selectel
+
+    # backup
+    backup = config_path.with_suffix(".yaml.bak")
+    backup.write_text(config_path.read_text())
+    with config_path.open("w") as f:
+        yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False, indent=2)
+
+    console.print(
+        f"[green]✓ config.yaml обновлён:[/green] "
+        f"{len(new_selectel)} selectel-camp хостеров, "
+        f"{len(non_selectel)} других сохранено. "
+        f"[dim](старая версия в {backup.name})[/dim]"
+    )
+
+
 # ------------------------------------------------------------------------- destroy
 _WLFINDER_PREFIX = "wlfinder-"
 

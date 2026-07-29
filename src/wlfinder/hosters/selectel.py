@@ -305,6 +305,16 @@ class SelectelHoster:
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
             log.error("selectel.cleanup_failed", floating_ip_id=fip_id, error=str(exc))
 
+    async def list_floating_ip_pools(self) -> list[dict[str, Any]]:
+        """Все внешние подсети региона: [{cidr, subnet_id, subnet_name, network_id}].
+
+        Используется командой ``pars scan``, чтобы построить карту «Selectel
+        /24 × TWL» без ручного curl. Доступно всем service-user'ам (не нужна
+        роль network.admin).
+        """
+        resp = await self._request("GET", "/floatingip_pools")
+        return list(resp.json().get("floatingip_pools", []))
+
     async def list_servers(self) -> list[ServerInfo]:
         resp = await self._request("GET", "/floatingips")
         return [
