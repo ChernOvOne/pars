@@ -34,6 +34,7 @@ inside the target /24 — no more roulette, only camping.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import time
 from datetime import datetime
@@ -51,6 +52,37 @@ from wlfinder.models import ServerInfo
 log = structlog.get_logger(__name__)
 
 _KEYSTONE_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+
+
+class _TokenCacheEntry:
+    """Один shared Keystone-токен + expiry + lock, чтобы не логиниться дважды."""
+
+    __slots__ = ("token", "expiry", "lock")
+
+    def __init__(self) -> None:
+        self.token: str | None = None
+        self.expiry: float = 0.0
+        self.lock = asyncio.Lock()
+
+
+# Модульный кеш: ключ = (account_id, user, project_id) → shared token.
+# Все SelectelHoster с одинаковыми creds делят один токен вместо N параллельных
+# auth-запросов, которые триггерят Selectel Keystone rate-limit (transport_retry).
+_TOKEN_CACHE: dict[tuple[str, str, str], _TokenCacheEntry] = {}
+_CACHE_LOCK = asyncio.Lock()
+
+
+async def _get_shared_token_entry(
+    account_id: str, user: str, project_id: str
+) -> _TokenCacheEntry:
+    """Найти/создать общий entry для тройки credentials (thread-safe init)."""
+    key = (account_id, user, project_id)
+    async with _CACHE_LOCK:
+        entry = _TOKEN_CACHE.get(key)
+        if entry is None:
+            entry = _TokenCacheEntry()
+            _TOKEN_CACHE[key] = entry
+    return entry
 
 
 class SelectelConfig(BaseModel):
@@ -94,8 +126,13 @@ class SelectelHoster:
         self._user = resolve_secret(cfg.service_user_env)
         self._password = resolve_secret(cfg.service_pass_env)
         self._project_id = resolve_secret(cfg.project_id_env)
-        self._token: str | None = None
-        self._token_expiry = 0.0
+        # Ключ shared-token'а: creds identity. Все hoster'ы с одинаковой
+        # тройкой (account, user, project) шарят один Keystone-токен.
+        self._creds_key = (
+            self._account_id.get_secret_value(),
+            self._user.get_secret_value(),
+            self._project_id.get_secret_value(),
+        )
         self._external_net: str | None = cfg.external_network_id
         # Ленивое сопоставление target_subnet_cidr → subnet_id (заполняется
         # первым же create()-запросом, потом кешируется до перезапуска).
@@ -115,43 +152,64 @@ class SelectelHoster:
         return f"https://{self._cfg.region}.cloud.api.selcloud.ru/network/v2.0"
 
     # ----------------------------------------------------------------- auth
-    async def _ensure_token(self) -> str:
-        if self._token is not None and time.time() < self._token_expiry - 60:
-            return self._token
-        body = {
-            "auth": {
-                "identity": {
-                    "methods": ["password"],
-                    "password": {
-                        "user": {
-                            "name": self._user.get_secret_value(),
-                            # Keystone domain name == Selectel account number.
-                            "domain": {"name": self._account_id.get_secret_value()},
-                            "password": self._password.get_secret_value(),
-                        }
+    async def _ensure_token(self, *, force: bool = False) -> str:
+        """Вернуть shared Keystone-токен. При ``force=True`` — новый (после 401).
+
+        Все SelectelHoster с одинаковыми credentials (account/user/project)
+        делят один токен через модульный `_TOKEN_CACHE`. Логин в один момент
+        времени делает только один hoster; остальные ждут его результата.
+        Это критично: при 14 camp-хостерах одновременный старт триггерил
+        Selectel Keystone rate-limit и порождал `hoster.transport_retry`.
+        """
+        entry = await _get_shared_token_entry(*self._creds_key)
+        now = time.time()
+        # быстрый путь: живой токен, не форсим
+        if not force and entry.token is not None and now < entry.expiry - 60:
+            return entry.token
+        async with entry.lock:
+            now = time.time()
+            # пере-проверка: пока ждали lock, другой hoster уже обновил
+            if not force and entry.token is not None and now < entry.expiry - 60:
+                return entry.token
+            body = {
+                "auth": {
+                    "identity": {
+                        "methods": ["password"],
+                        "password": {
+                            "user": {
+                                "name": self._user.get_secret_value(),
+                                # Keystone domain name == Selectel account number.
+                                "domain": {"name": self._account_id.get_secret_value()},
+                                "password": self._password.get_secret_value(),
+                            }
+                        },
                     },
-                },
-                "scope": {"project": {"id": self._project_id.get_secret_value()}},
+                    "scope": {"project": {"id": self._project_id.get_secret_value()}},
+                }
             }
-        }
-        resp = await request_with_retries(
-            self._client,
-            "POST",
-            _KEYSTONE_URL,
-            headers={"Content-Type": "application/json"},
-            json=body,
-            ok=(200, 201),
-            label="selectel-auth",
-        )
-        token: str | None = resp.headers.get("X-Subject-Token")
-        if not token:
-            raise HosterAuthError("selectel: Keystone returned no X-Subject-Token")
-        self._token = token
-        try:
-            self._token_expiry = _parse_iso(resp.json()["token"]["expires_at"])
-        except (KeyError, ValueError, TypeError):
-            self._token_expiry = time.time() + 3600
-        return token
+            resp = await request_with_retries(
+                self._client,
+                "POST",
+                _KEYSTONE_URL,
+                headers={"Content-Type": "application/json"},
+                json=body,
+                ok=(200, 201),
+                label="selectel-auth",
+            )
+            token: str | None = resp.headers.get("X-Subject-Token")
+            if not token:
+                raise HosterAuthError("selectel: Keystone returned no X-Subject-Token")
+            entry.token = token
+            try:
+                entry.expiry = _parse_iso(resp.json()["token"]["expires_at"])
+            except (KeyError, ValueError, TypeError):
+                entry.expiry = time.time() + 3600
+            log.info(
+                "selectel.token_refreshed",
+                hoster=self.name,
+                expires_in=int(entry.expiry - time.time()),
+            )
+            return token
 
     async def _request(
         self,
@@ -171,8 +229,8 @@ class SelectelHoster:
                 json=json, params=params, ok=ok, label="selectel",
             )
         except HosterAuthError:
-            self._token = None  # expired — refresh once and retry
-            token = await self._ensure_token()
+            # expired / rejected — форс-рефреш общего токена и одна попытка
+            token = await self._ensure_token(force=True)
             return await request_with_retries(
                 self._client, method, url,
                 headers={"X-Auth-Token": token, "Content-Type": "application/json"},
