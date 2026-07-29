@@ -4,23 +4,29 @@ general:
   cache_dir: ~/.cache/wlfinder
 
 whitelist:
+  # Только TWL — сканер openlibrecommunity ежедневно пробивает IPv4 через
+  # реальные симки МТС/Билайн/МегаФон/Т2 и вносит только те IP/подсети, что
+  # реально ответили через мобильные данные. Свежесть — сутки.
+  #
+  # hxehex/* (legacy, статичный) НЕ подключён специально: он широко метил
+  # /24 много лет назад, но операторы давно вывели половину этих подсетей
+  # из whitelist'ов. Такой источник даёт «фантомные» HIT'ы — wlfinder
+  # засчитывает IP как белый, а через симку он не работает. Пример: HIT
+  # 5.159.100.248 (ru-3) — в hxehex-cidr есть, в TWL нет, реально не
+  # проходит через операторов.
+  #
+  # Если очень хочется больше кандидатов на camp — понизить min_percent
+  # у twl-subnets (например до 30). Это добавит /24 «частично работающих»,
+  # где не все 254 IP белые — camp будет чаще получать чёрные IP, но реже
+  # промахиваться мимо оператора.
   sources:
-    # Основной источник: openlibrecommunity/twl — проверенные IP, обновляется ~ежедневно.
     - type: github
       name: twl-verified
       url: https://raw.githubusercontent.com/openlibrecommunity/twl/main/code/scan/out/verify/verified.txt
-    # Широкое покрытие: /24-подсети, где >= min_percent адресов реально отвечают с симки.
     - type: twl_subnets
       name: twl-subnets
       url: https://raw.githubusercontent.com/openlibrecommunity/twl/main/code/subnet/out/subnets.c.json
       min_percent: 50
-    # Большое legacy-покрытие (CIDR + IP). Обновляется реже — держим как дополнение.
-    - type: github
-      name: hxehex-cidr
-      url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/cidrwhitelist.txt
-    - type: github
-      name: hxehex-ip
-      url: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/ipwhitelist.txt
   refresh_ttl_hours: 12
 
 orchestrator:
@@ -80,7 +86,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 87.228.101.0/24   # 70 whitelist IP — самая плотная
+    target_subnet_cidr: 87.228.101.0/24   # 70 TWL-verified IP — самая плотная
     batch_size: 1                          # каждая попытка — один запрос
 
   - name: selectel-ru1-46.182.24
@@ -91,7 +97,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-1
-    target_subnet_cidr: 46.182.24.0/24     # 62 whitelist IP
+    target_subnet_cidr: 46.182.24.0/24     # 62 TWL-verified IP
     batch_size: 1
 
   - name: selectel-ru3-185.91.52
@@ -102,7 +108,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 185.91.52.0/24     # 60 whitelist IP
+    target_subnet_cidr: 185.91.52.0/24     # 60 TWL-verified IP
     batch_size: 1
 
   - name: selectel-ru3-185.91.53
@@ -113,7 +119,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 185.91.53.0/24     # 58 whitelist IP
+    target_subnet_cidr: 185.91.53.0/24     # 58 TWL-verified IP
     batch_size: 1
 
   - name: selectel-ru3-185.91.54
@@ -124,7 +130,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 185.91.54.0/24     # 58 whitelist IP
+    target_subnet_cidr: 185.91.54.0/24     # 58 TWL-verified IP
     batch_size: 1
 
   - name: selectel-ru9-31.129.42
@@ -135,7 +141,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-9
-    target_subnet_cidr: 31.129.42.0/24     # 50 whitelist IP, вся /24 в CIDR
+    target_subnet_cidr: 31.129.42.0/24     # 50 TWL-verified IP, вся /24 в CIDR
     batch_size: 1
 
   - name: selectel-ru3-188.68.218
@@ -146,7 +152,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 188.68.218.0/24    # 48 whitelist IP
+    target_subnet_cidr: 188.68.218.0/24    # 48 TWL-verified IP
     batch_size: 1
 
   - name: selectel-ru3-37.9.4
@@ -157,7 +163,7 @@ hosters:
     service_pass_env: SELECTEL_SERVICE_PASS
     project_id_env: SELECTEL_PROJECT_ID
     region: ru-3
-    target_subnet_cidr: 37.9.4.0/24        # 12 whitelist IP, вся /24 в CIDR
+    target_subnet_cidr: 37.9.4.0/24        # 12 TWL-verified IP, вся /24 в CIDR
     batch_size: 1
 
   - name: cloudru
