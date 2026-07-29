@@ -32,7 +32,9 @@ log = structlog.get_logger(__name__)
 
 # Circuit breaker: if this many batches fail in a row (every hoster erroring,
 # a network outage, ...) the run aborts instead of spinning uselessly.
-_MAX_CONSECUTIVE_ERRORS = 15
+# Selectel-camp может выдавать сетевые всплески (transport_retry) — поэтому
+# порог поднят до 50; из 50 подряд hard-error'ов только реальная авария.
+_MAX_CONSECUTIVE_ERRORS = 50
 
 
 class NoHitError(RuntimeError):
@@ -182,7 +184,14 @@ class Orchestrator:
                     # свободных IP в /24 нет, попробуем ещё раз». Такой батч
                     # НЕ должен считаться в circuit-breaker, иначе первые же
                     # 15 попыток camp'а убьют весь прогон.
-                    is_soft = "pool_exhausted" in str(exc)
+                    # pool_exhausted — Selectel-camp «нет свободных IP в /24».
+                    # transport error — сетевой всплеск, обычно проходит на след.
+                    # попытке. Оба типа считаем soft — не гасим circuit-breaker.
+                    err_str = str(exc)
+                    is_soft = (
+                        "pool_exhausted" in err_str
+                        or "transport error" in err_str
+                    )
                     async with self._slot_lock:
                         self._error_count += 1
                         if not is_soft:
@@ -280,7 +289,10 @@ class Orchestrator:
                 # их «жёсткими» и не убил прогон после первых 15 попыток.
                 errs = [r for r in results if isinstance(r, BaseException)]
                 soft_marker = ""
-                if errs and all("pool_exhausted" in str(r) for r in errs):
+                if errs and all(
+                    "pool_exhausted" in str(r) or "transport error" in str(r)
+                    for r in errs
+                ):
                     soft_marker = " (pool_exhausted)"
                 raise HosterError(
                     f"{hoster.name}: all {size} allocations in the batch failed"
